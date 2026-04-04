@@ -1,8 +1,8 @@
-# Mastra-Claw — Claude Code Instructions
+# MastraClaw — Claude Code Instructions
 
 ## Project Overview
 
-Mastra-Claw is an enterprise-ready personal AI agent built on [Mastra.ai](https://mastra.ai). It provides an opinionated, curated base configuration that combines three architectural paradigms:
+MastraClaw is an enterprise-ready personal AI agent built on [Mastra.ai](https://mastra.ai). It provides an opinionated, curated base configuration that combines three architectural paradigms:
 
 1. **Skill-based** — Agent capabilities defined as markdown SOPs, flexible and learnable
 2. **Workflow-based** — Hard-coded multi-step workflows with durable execution (Mastra workflows)
@@ -52,6 +52,7 @@ The hybrid approach is the primary pattern. It solves the compound error problem
 - **Orchestrator/Specialist** — One orchestrator (strong model) delegates to specialist sub-agents (cheaper models). Sub-agents get fresh context per task (context firewalls).
 - **Workflows-as-Tools** — Complex multi-step operations are coded as Mastra workflows and exposed as single tools to agents.
 - **Scoped Tool Assignment** — Each agent receives only the tools it actually needs. The orchestrator has its tools, each specialist gets exactly its required toolset — no unnecessary tool bloat.
+- **Human-in-the-Loop** — No destructive action without user approval. Mastra's suspend/resume enables approval gates at any workflow step. Approval requests propagate: sub-agent → orchestrator → user channel (Telegram/Teams/Web UI). Configurable trust levels per action type.
 - **4-Tier Memory** — Message History → Working Memory → Observational Memory → Semantic Recall.
 
 ## Mastra Studio
@@ -142,7 +143,7 @@ Both options are complementary to Mastra's native workflows — use them for ext
 ## Project Structure
 
 ```
-mastra-claw/
+mastraclaw/
 ├── apps/
 │   ├── api/                          # Mastra backend
 │   │   └── src/mastra/

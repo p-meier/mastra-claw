@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/header.png" alt="Mastra-Claw" width="800">
+  <img src="assets/header.png" alt="MastraClaw" width="800">
 </p>
 
 <p align="center">
@@ -15,13 +15,13 @@
 
 ---
 
-## Why Mastra-Claw
+## Why MastraClaw
 
 There's no shortage of personal AI agents. Since OpenClaw, the space has exploded with projects promising autonomous assistants that can do everything. They all share the same fatal flaw: **they rebuild everything from scratch**.
 
 Custom memory systems. Custom workflow engines. Custom security layers. Agents that rewrite their own source code. The result is fragile software with hundreds of thousands of lines of code, dozens of dependencies, and security models that exist only at the application level.
 
-**Mastra-Claw takes the opposite approach.** Instead of building yet another framework, we compose battle-tested, enterprise-backed components into an opinionated base configuration:
+**MastraClaw takes the opposite approach.** Instead of building yet another framework, we compose battle-tested, enterprise-backed components into an opinionated base configuration:
 
 - **Mastra.ai** handles agents, workflows, memory, tools, observability, and sandboxing — backed by the Gatsby.js founders, funded by Paul Graham and Guillermo Rauch, used in production by Replit and Marsh McLennan
 - **Convex** provides a reactive database with durable functions, vector search, and human-agent coordination
@@ -41,13 +41,13 @@ The goal is not another feature-rich agent. It's a **minimal, curated foundation
 
 **Channel-agnostic.** Built on the [Vercel Chat SDK](https://chat-sdk.dev) — write your bot logic once, deploy to Slack, Microsoft Teams, Telegram, Discord, Google Chat, and more. The agent logic is completely decoupled from the delivery channel.
 
-**Start simple, scale when needed.** Mastra-Claw starts as a personal agent for one person — a founder, a department lead, an entrepreneur. But the architecture supports progressive evolution: multiple agent instances coordinated through a central hub, multi-user access, department-level orchestration. Fork the repo, add your customizations, pull upstream updates. The core codebase stays small because complexity lives in the frameworks and packages, not in your code.
+**Start simple, scale when needed.** MastraClaw starts as a personal agent for one person — a founder, a department lead, an entrepreneur. But the architecture supports progressive evolution: multiple agent instances coordinated through a central hub, multi-user access, department-level orchestration. Fork the repo, add your customizations, pull upstream updates. The core codebase stays small because complexity lives in the frameworks and packages, not in your code.
 
 **Opinionated but extensible.** Strong defaults, minimal configuration. But when you need to customize, you modify code — not sprawling config files. The codebase is designed to be forked and adapted.
 
 ## The Three Paradigms
 
-Most agent systems force you into one approach. Mastra-Claw supports all three and lets you choose per task:
+Most agent systems force you into one approach. MastraClaw supports all three and lets you choose per task:
 
 ### 1. Skill-Based (Flexible)
 
@@ -80,7 +80,7 @@ Agent calls: researchBriefingWorkflow (single tool call)
 Workflow executes: 10 reliable steps with typed data flow
 ```
 
-**This is the primary pattern in Mastra-Claw.**
+**This is the primary pattern in MastraClaw.**
 
 ## The Compound Error Problem
 
@@ -96,7 +96,7 @@ Why does this matter? Because of what Andrej Karpathy calls "agentic math":
 
 Even at 95% reliability per step, a 20-step autonomous task fails nearly two-thirds of the time. This is why pure skill-based agents break down on complex tasks — and why workflows matter.
 
-**Mastra-Claw's solution:** Encapsulate complex operations in typed, validated workflows. The agent makes one tool call. The workflow handles the complexity with checkpointing, error handling, and human-in-the-loop escalation.
+**MastraClaw's solution:** Encapsulate complex operations in typed, validated workflows. The agent makes one tool call. The workflow handles the complexity with checkpointing, error handling, and human-in-the-loop escalation.
 
 ## Architecture
 
@@ -141,6 +141,8 @@ Even at 95% reliability per step, a 20-step autonomous task fails nearly two-thi
 
 - **4-Tier Memory** — Message History (raw thread) → Working Memory (structured persistent data) → Observational Memory (compressed historical insights) → Semantic Recall (vector-based retrieval).
 
+- **Human-in-the-Loop** — No destructive action without user approval. Approval requests propagate up the agent hierarchy: sub-agent suspends → orchestrator receives → forwards to user via Telegram/Teams/Web UI. The user confirms or rejects with a single tap. Configurable trust levels per action type.
+
 - **Separate Compute Contexts** — Agent harness runs in a trusted context with secret access. Code execution and untrusted operations run in isolated sandboxes (E2B, Daytona, Vercel, Docker, or local).
 
 ## Tech Stack
@@ -173,15 +175,17 @@ Even at 95% reliability per step, a 20-step autonomous task fails nearly two-thi
 - **Observability** — OpenTelemetry-based tracing via Langfuse, Langsmith, or custom exporters. Sensitive data filtering built-in. Full agent lifecycle coverage (LLM calls, tools, memory, workflows)
 - **Model-agnostic** — Vercel AI Gateway, OpenRouter, all major providers, private/on-premise model APIs
 - **Evaluations & testing** — Built-in scorers for hallucination, toxicity, bias, faithfulness, tool call accuracy, trajectory accuracy, RAG quality, and custom LLM-judged criteria. CI/CD-ready
+- **Human-in-the-Loop** — No destructive action without explicit user approval. Mastra's built-in suspend/resume enables approval gates at any workflow step. Approval requests propagate from sub-agent → orchestrator → user channel (e.g., Telegram). Configurable per action: auto-approve trusted operations, require confirmation for emails, posts, calendar changes
 - **Guard rails & processors** — PII detection/redaction (GDPR/CCPA/HIPAA), prompt injection detection, content moderation, system prompt scrubbing, Unicode normalization — composable as input/output processors
 - **MCP Server & Client** — Expose agents and data via MCP for Claude Code, Claude Cowork, and IDEs. Consume external MCP servers. Aggregate via [Composio.dev](https://composio.dev) with unified secrets management
+- **Slash commands** — Predefined shortcuts (`/brief`, `/research`, `/remind`, `/calendar`, `/status`, etc.) in all channels and web UI. Implemented as skills — extensible by adding new skill files
 - **Reactive database** — Real-time queries, full-text search, vector/semantic search via Convex — all data agentically queryable and accessible via MCP
 - **Progressive scaling** — Start as a single personal agent, scale to multi-agent, multi-user, department-level orchestration
 - **Self-hostable** — Every component runs on-premise for full data sovereignty
 
 ## Compliance & Data Sovereignty
 
-Mastra-Claw is designed to be enterprise-compliant from day one — not as an afterthought.
+MastraClaw is designed to be enterprise-compliant from day one — not as an afterthought.
 
 **Guard Rails & PII Protection** — Mastra processors run before/after every agent request: `PIIDetector` (detects and redacts personal data with configurable strategies: block, warn, filter, redact), `PromptInjectionDetector` (blocks injection attempts), `ModerationProcessor` (content moderation), `SystemPromptScrubber` (prevents prompt leakage), `UnicodeNormalizer` (prevents encoding attacks), `TokenLimiterProcessor` (enforces budgets). All composable and stackable.
 
@@ -204,7 +208,7 @@ Every deployment option uses the same codebase. Moving from cloud to on-premise 
 
 ## Progressive Evolution
 
-Mastra-Claw follows a **start simple, scale when needed** model:
+MastraClaw follows a **start simple, scale when needed** model:
 
 ```
 Phase 1: Personal Agent          → One person, one agent, basic workflows
@@ -229,8 +233,8 @@ When you outgrow the base configuration, fork the repo and customize. The archit
 ### Installation
 
 ```bash
-git clone https://github.com/p-meier/mastra-claw.git
-cd mastra-claw
+git clone https://github.com/p-meier/mastraclaw.git
+cd mastraclaw
 npm install
 ```
 
@@ -283,7 +287,7 @@ This starts both the Mastra API (port 4111) and the Next.js dashboard (port 3000
 ## Project Structure
 
 ```
-mastra-claw/
+mastraclaw/
 ├── apps/
 │   ├── api/                          # Mastra backend
 │   │   └── src/mastra/
@@ -312,7 +316,7 @@ mastra-claw/
 
 ### Models
 
-Mastra-Claw is model-agnostic. Configure via environment variables:
+MastraClaw is model-agnostic. Configure via environment variables:
 
 ```bash
 # Orchestrator uses a strong model (handles routing, complex reasoning)
@@ -367,7 +371,7 @@ Every component is self-hostable:
 
 ## Status
 
-Mastra-Claw is under active development. The project is public for transparency and to share the architectural approach, but it is not yet accepting external contributions. If you're interested in the project, star the repo and watch for updates.
+MastraClaw is under active development. The project is public for transparency and to share the architectural approach, but it is not yet accepting external contributions. If you're interested in the project, star the repo and watch for updates.
 
 ## License
 
