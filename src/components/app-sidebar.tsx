@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Image from "next/image"
+import Link from "next/link"
 import {
   BarChart3Icon,
   BookOpenIcon,
@@ -20,6 +21,7 @@ import {
   WorkflowIcon,
 } from "lucide-react"
 
+import { signOutAction } from "@/app/(auth)/login/actions"
 import {
   Avatar,
   AvatarFallback,
@@ -47,16 +49,11 @@ import {
   SidebarMenuItem,
   SidebarRail,
 } from "@/components/ui/sidebar"
+import type { CurrentUser } from "@/lib/auth"
 
-const data = {
-  user: {
-    name: "Patrick Meier",
-    email: "patrick@shift-consulting.ai",
-    initials: "PM",
-    avatar: "",
-  },
+const nav = {
   navPlatform: [
-    { title: "Dashboard", url: "#", icon: GaugeIcon, isActive: true },
+    { title: "Dashboard", url: "/", icon: GaugeIcon },
     { title: "Agents", url: "#", icon: BotIcon },
     { title: "Workflows", url: "#", icon: WorkflowIcon },
     { title: "Tools", url: "#", icon: CircuitBoardIcon },
@@ -74,16 +71,39 @@ const data = {
     { title: "Settings", url: "#", icon: SettingsIcon },
     { title: "Support", url: "#", icon: LifeBuoyIcon },
   ],
+} as const
+
+function emailToInitials(email: string): string {
+  if (!email) return "??"
+  const local = email.split("@")[0] ?? ""
+  const parts = local.split(/[._-]+/).filter(Boolean)
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase()
+  }
+  return local.slice(0, 2).toUpperCase()
 }
 
-export function AppSidebar() {
+function emailToDisplayName(email: string): string {
+  if (!email) return "Unknown"
+  const local = email.split("@")[0] ?? ""
+  return local
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ")
+}
+
+export function AppSidebar({ currentUser }: { currentUser: CurrentUser }) {
+  const initials = emailToInitials(currentUser.email)
+  const displayName = emailToDisplayName(currentUser.email)
+
   return (
     <Sidebar collapsible="icon">
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton size="lg" asChild>
-              <a href="#">
+              <Link href="/">
                 <Image
                   src="/logo.png"
                   alt="MastraClaw"
@@ -98,7 +118,7 @@ export function AppSidebar() {
                     Enterprise AI Agent
                   </span>
                 </div>
-              </a>
+              </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
@@ -109,17 +129,13 @@ export function AppSidebar() {
           <SidebarGroupLabel>Platform</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {data.navPlatform.map((item) => (
+              {nav.navPlatform.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={item.isActive}
-                    tooltip={item.title}
-                  >
-                    <a href={item.url}>
+                  <SidebarMenuButton asChild tooltip={item.title}>
+                    <Link href={item.url}>
                       <item.icon />
                       <span>{item.title}</span>
-                    </a>
+                    </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
@@ -131,13 +147,13 @@ export function AppSidebar() {
           <SidebarGroupLabel>Insights</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {data.navInsights.map((item) => (
+              {nav.navInsights.map((item) => (
                 <SidebarMenuItem key={item.title}>
                   <SidebarMenuButton asChild tooltip={item.title}>
-                    <a href={item.url}>
+                    <Link href={item.url}>
                       <item.icon />
                       <span>{item.title}</span>
-                    </a>
+                    </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
@@ -149,13 +165,13 @@ export function AppSidebar() {
           <SidebarGroupLabel>Workspace</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {data.navSettings.map((item) => (
+              {nav.navSettings.map((item) => (
                 <SidebarMenuItem key={item.title}>
                   <SidebarMenuButton asChild tooltip={item.title}>
-                    <a href={item.url}>
+                    <Link href={item.url}>
                       <item.icon />
                       <span>{item.title}</span>
-                    </a>
+                    </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
@@ -174,17 +190,17 @@ export function AppSidebar() {
                   className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
                 >
                   <Avatar className="size-8 rounded-lg">
-                    <AvatarImage src={data.user.avatar} alt={data.user.name} />
-                    <AvatarFallback className="rounded-lg">
-                      {data.user.initials}
+                    <AvatarImage src="" alt={displayName} />
+                    <AvatarFallback className="rounded-lg bg-gradient-to-br from-violet-500 to-cyan-400 text-white font-medium">
+                      {initials}
                     </AvatarFallback>
                   </Avatar>
                   <div className="grid flex-1 text-left text-sm leading-tight">
                     <span className="truncate font-semibold">
-                      {data.user.name}
+                      {displayName}
                     </span>
                     <span className="text-muted-foreground truncate text-xs">
-                      {data.user.email}
+                      {currentUser.email}
                     </span>
                   </div>
                   <ChevronsUpDownIcon className="ml-auto size-4" />
@@ -199,36 +215,49 @@ export function AppSidebar() {
                 <DropdownMenuLabel className="p-0 font-normal">
                   <div className="flex items-center gap-2 px-1 py-1.5 text-left text-sm">
                     <Avatar className="size-8 rounded-lg">
-                      <AvatarImage
-                        src={data.user.avatar}
-                        alt={data.user.name}
-                      />
-                      <AvatarFallback className="rounded-lg">
-                        {data.user.initials}
+                      <AvatarImage src="" alt={displayName} />
+                      <AvatarFallback className="rounded-lg bg-gradient-to-br from-violet-500 to-cyan-400 text-white font-medium">
+                        {initials}
                       </AvatarFallback>
                     </Avatar>
                     <div className="grid flex-1 text-left text-sm leading-tight">
                       <span className="truncate font-semibold">
-                        {data.user.name}
+                        {displayName}
                       </span>
                       <span className="text-muted-foreground truncate text-xs">
-                        {data.user.email}
+                        {currentUser.email}
                       </span>
                     </div>
                   </div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
-                  <DropdownMenuItem>
-                    <SettingsIcon />
-                    Account Settings
+                  <DropdownMenuItem asChild>
+                    <Link href="/account/settings" className="cursor-pointer">
+                      <SettingsIcon />
+                      Account Settings
+                    </Link>
                   </DropdownMenuItem>
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem>
-                  <LogOutIcon />
-                  Sign out
-                </DropdownMenuItem>
+                {/*
+                  Sign-out is a Server Action wrapped in a form. Using
+                  `asChild` to render the DropdownMenuItem as the form's
+                  submit button means the keyboard shortcut + Radix UI
+                  semantics still work, while the actual POST happens via
+                  the form's `action`.
+                */}
+                <form action={signOutAction}>
+                  <DropdownMenuItem asChild>
+                    <button
+                      type="submit"
+                      className="w-full cursor-pointer"
+                    >
+                      <LogOutIcon />
+                      Sign out
+                    </button>
+                  </DropdownMenuItem>
+                </form>
               </DropdownMenuContent>
             </DropdownMenu>
           </SidebarMenuItem>

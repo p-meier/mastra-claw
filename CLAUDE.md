@@ -39,7 +39,9 @@ The hybrid pattern solves the compound error problem (95% per-step accuracy degr
 | MCP Integration | Mastra MCP client (stored MCP connections) | Dynamic tool acquisition without code changes |
 | Validation | Zod | Schema validation for all tool inputs/outputs and API boundaries |
 
-**Explicitly not used:** Convex, LibSQL (production), Vercel Chat SDK, Doppler, Composio (Phase 1), separate API service.
+**Explicitly not used:** Convex, LibSQL (no degraded local fallback), Vercel Chat SDK, Doppler, Composio (Phase 1), separate API service.
+
+**One architectural path, identical in dev and prod.** Local development uses `npx supabase start`, which boots the entire Supabase stack (Postgres + GoTrue Auth + MinIO Storage + pgvector + pgsodium/Vault) on the developer's machine via Docker. The same `@mastra/pg` and `@mastra/s3` providers are wired against `127.0.0.1` URLs locally and against `*.supabase.co` URLs in production — no `if (mode === 'local')` branches anywhere in the codebase. Docker is a hard prerequisite for working on MastraClaw. See `ARCHITECTURE.md` §3.3.
 
 ## Architecture (Summary)
 
@@ -53,7 +55,8 @@ The hybrid pattern solves the compound error problem (95% per-step accuracy degr
 │                          │              │             │       │
 │                          └──────────────┴─────────────┘       │
 │                                    │                          │
-│                          scopedMastra(userId)                  │
+│                       mastraFor(currentUser)                   │
+│                  (role-aware: user vs admin facade)            │
 │                                    │                          │
 │       ┌────────────────────────────┴──────────────────┐       │
 │       │            Mastra (in-process)                 │       │
@@ -90,11 +93,13 @@ The hybrid pattern solves the compound error problem (95% per-step accuracy degr
 
 - **Server-only execution boundary (CRITICAL).** Mastra, secrets, LLM keys, and any privileged code live exclusively in Server Components, Route Handlers, and Server Actions. **Never** in Client Components, never in browser bundles, never in `NEXT_PUBLIC_*` env vars. Importing `@/mastra` or `@mastra/*` in a `'use client'` file is a security incident. CI must enforce this.
 
-- **Multi-tenant from day one.** Every database row carries an owner. The data model and authorization layer assume multiple users — Phase 1 just happens to ship with one. There are no single-user shortcuts anywhere.
+- **Multi-tenant and role-aware from day one.** Every database row carries an owner. Every authenticated user has a role (`'user'` or `'admin'`). The data model, the authorization layer, and the RLS policies assume multiple users in multiple roles — Phase 1 just happens to ship with one user (Patrick) holding the `admin` role. There are no single-user or single-role shortcuts anywhere.
 
-- **`scopedMastra(userId)` wrapper.** Application code never calls `mastra.editor.*` directly. It calls `scopedMastra(userId).agent.list()` (or `.get`, `.create`, `.update`, `.delete`, `.invoke`) which automatically scopes by `authorId`, asserts ownership, and propagates the user identity into Mastra via `requestContext`. The raw `mastra` instance is reserved for `src/mastra/index.ts` and admin scripts. A grep for `mastra.editor.` outside `src/mastra/lib/scoped-mastra.ts` is a red flag.
+- **`mastraFor(currentUser)` factory.** Application code never calls `mastra.editor.*` directly. It calls `mastraFor(currentUser)` where `currentUser` is `{ userId, email, role }` returned by `getCurrentUser()`. The factory dispatches to either `userMastra(userId)` (filtered by `authorId`, ownership asserted on every read/write) or `adminMastra(userId)` (unfiltered, plus admin-only operations like `listAllUsers`, `setUserRole`, `impersonate`). Both facades expose the same agent/prompt/skill/mcp/scorer/workspace/invoke surface; admin-only operations live only on the admin facade. The raw `mastra` instance is reserved for `src/mastra/index.ts` and the factory itself. A grep for `mastra.editor.` outside `src/mastra/lib/mastra-for.ts` is a red flag and CI must fail.
 
-- **Defense in depth with Postgres RLS.** On top of `scopedMastra`, every Mastra storage table and every app table has Row-Level Security policies that enforce `authorId = auth.uid()`. Two independent layers — bug in the wrapper still cannot leak data.
+- **Roles via `app_metadata`, never `user_metadata`.** Roles live in `auth.users.raw_app_meta_data.role` (app-controlled, only writable by service-role). The user cannot promote themselves. Server reads the role from `getCurrentUser()`; clients must never send a role from the browser. Authorization decisions happen at the boundary of every Server Action / Route Handler with an explicit `if (currentUser.role !== 'admin') throw new AdminRequiredError()` check before calling admin-only logic.
+
+- **Defense in depth with role-aware Postgres RLS.** On top of `mastraFor`, every Mastra storage table and every app table has Row-Level Security policies of the form `using (author_id = auth.uid()::text or auth.role() = 'admin')`. The `auth.role()` SQL helper reads `auth.jwt() -> 'app_metadata' ->> 'role'`. Two independent layers — a bug in the factory still cannot leak data, and an admin policy still cannot accidentally let users see each other's rows.
 
 - **Main Agent + Sub Agents with bindings-based routing.** The Main Agent handles general traffic on the default Telegram bot and Web UI. Sub-agents are reachable both indirectly (via Main Agent delegation) and directly (via dedicated Telegram bots whose tokens are stored in Vault and mapped via the `bindings` table). Adding a new direct sub-agent bot requires zero code: bot token in Vault + row in `bindings` + webhook registration.
 
@@ -225,7 +230,7 @@ mastra-claw/
 │   │   ├── skills/
 │   │   │   └── built-in/             # Markdown skills shipped by default
 │   │   └── lib/
-│   │       ├── scoped-mastra.ts      # Per-user wrapper (NEVER bypass)
+│   │       ├── mastra-for.ts         # Role-aware factory (NEVER bypass)
 │   │       ├── secret-service.ts     # Vault-backed per-user secrets
 │   │       └── errors.ts
 │   │
@@ -235,7 +240,7 @@ mastra-claw/
 │   │   │   └── client.ts             # Browser client (no Mastra ever)
 │   │   ├── channels/
 │   │   │   ├── router.ts             # Bindings resolution
-│   │   │   ├── dispatch.ts           # Hands resolved agent to scopedMastra
+│   │   │   ├── dispatch.ts           # Hands resolved agent to mastraFor(currentUser)
 │   │   │   └── telegram/             # Telegram in/out adapter
 │   │   └── auth.ts                   # getUserId() helper
 │   │
@@ -247,7 +252,7 @@ mastra-claw/
 │   │   │   ├── skills/page.tsx       # Skill management
 │   │   │   └── settings/             # Settings + setup wizard
 │   │   ├── api/
-│   │   │   ├── chat/route.ts         # Server-only: invokes scopedMastra
+│   │   │   ├── chat/route.ts         # Server-only: invokes mastraFor(currentUser)
 │   │   │   ├── telegram/[bot]/route.ts  # Telegram webhook (per bot)
 │   │   │   └── ...
 │   │   ├── layout.tsx
@@ -338,9 +343,19 @@ const tool = createTool({
 ## Commands
 
 ```bash
+# One-time setup (after clone)
+npx supabase start       # boots local Postgres + Auth + Storage + Studio via Docker (~30s first run)
+cp .env.local.example .env.local   # already points at the local Supabase URLs/keys printed by `supabase start`
+npx supabase db push     # runs SQL migrations into the local Postgres
+
 # Development
 npm run dev              # Next.js dev server (Mastra is embedded, not a separate process)
 npm run dev:studio       # Mastra Studio (separate dev process, same DB) at http://localhost:4111
+
+# Local Supabase lifecycle
+npx supabase status      # show URLs / keys / health
+npx supabase stop        # tear down the local stack
+npx supabase db reset    # nuke + re-migrate the local DB
 
 # Build & run
 npm run build            # next build
@@ -349,6 +364,8 @@ npm run start            # next start
 # Lint
 npm run lint
 ```
+
+Docker must be installed and running. The local Supabase stack provides the same Postgres + GoTrue + Storage + pgvector + pgsodium environment as production, so RLS, Vault, role-aware auth, and `@mastra/s3` work identically in dev and prod.
 
 ## Backup & Restore
 
@@ -387,14 +404,21 @@ Full backup architecture, rationale, and integrity-test procedure: [`ARCHITECTUR
 
 ## Environment Variables — Layer A (Bootstrap Only)
 
-These are the **only** secrets that live in `process.env`. They are the bare minimum for the system to start, configured manually on Vercel / Railway / your host. Everything else is in Supabase Vault and read at runtime via `SecretService` (per user).
+These are the **only** secrets that live in `process.env`. Everything else is per-user, lives in Supabase Vault, and is read at runtime via `SecretService`.
+
+The same set of variables is used in development (pointing at the local Supabase started by `npx supabase start`) and in production (pointing at the cloud project). There is no mode switch.
 
 ```bash
 # === Supabase (mandatory) ===
-DATABASE_URL=                       # postgres://... (full Postgres connection)
-SUPABASE_PROJECT_REF=               # project reference, used to build URLs
+DATABASE_URL=                       # postgres://... full Postgres connection
+                                    # local: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+                                    # prod:  postgresql://postgres:<pw>@db.<ref>.supabase.co:5432/postgres
+SUPABASE_URL=                       # local: http://127.0.0.1:54321
+                                    # prod:  https://<ref>.supabase.co
 SUPABASE_ANON_KEY=                  # anon key for client-side Supabase Auth
 SUPABASE_SERVICE_ROLE_KEY=          # service role key — server-side only, NEVER NEXT_PUBLIC_
+SUPABASE_S3_ENDPOINT=               # local: http://127.0.0.1:54321/storage/v1/s3
+                                    # prod:  https://<ref>.supabase.co/storage/v1/s3
 SUPABASE_S3_ACCESS_KEY_ID=          # for @mastra/s3 against Supabase Storage
 SUPABASE_S3_SECRET_ACCESS_KEY=      # for @mastra/s3 against Supabase Storage
 
@@ -402,6 +426,8 @@ SUPABASE_S3_SECRET_ACCESS_KEY=      # for @mastra/s3 against Supabase Storage
 MAIN_AGENT_MODEL=                   # e.g., anthropic/claude-sonnet-4-5
 SPECIALIST_MODEL=                   # e.g., anthropic/claude-haiku-4-5
 ```
+
+The local Supabase values are printed by `npx supabase start` and rarely change. Copy them once into `.env.local` and forget about them.
 
 **Forbidden:**
 - `NEXT_PUBLIC_*` for any of the above. The service role key in particular must never reach the browser.
@@ -448,11 +474,15 @@ Processors are composable and can be stacked. Apply them as input processors (pr
 - **NEVER call LLM providers or execute Mastra code from a Client Component.** Client → Server Action / Route Handler → Mastra. Always.
 - **NEVER store user secrets (LLM keys, bot tokens, etc.) in env vars.** They go in Supabase Vault, scoped per user via `SecretService`.
 
-### Multi-tenancy (foundation)
-- **NEVER call `mastra.editor.*` directly from application code.** Always go through `scopedMastra(userId)`. The raw instance is reserved for `src/mastra/index.ts` and admin scripts. CI greps for violations.
-- **NEVER hardcode `userId = 'patrick'`** or any other constant. Always derive from Supabase Auth via `getUserId()`.
-- **NEVER add a new Supabase table without RLS policies.** Every tenant-owned table gets `enable row level security` plus a per-user policy. CI grep enforces this.
-- **NEVER list/get/update/delete a Mastra resource without `authorId` filtering** (or via the wrapper which does it for you).
+### Multi-tenancy & roles (foundation)
+- **NEVER call `mastra.editor.*` directly from application code.** Always go through `mastraFor(currentUser)`. The raw instance is reserved for `src/mastra/index.ts` and the factory itself. CI greps for violations.
+- **NEVER hardcode `userId = 'patrick'`, `role = 'admin'`,** or any other constant identity. Always derive from Supabase Auth via `getCurrentUser()`.
+- **NEVER trust a role sent from the client.** The role lives in the JWT (`app_metadata.role`) and is read server-side from `getCurrentUser()`. Anything the browser claims about its own role is cosmetic at best, dangerous at worst.
+- **NEVER store the role in `user_metadata`.** User metadata is user-controlled — they could promote themselves. Roles go in `app_metadata`, only writable by the service-role client.
+- **NEVER set `app_metadata.role` from a client component or without admin-role check.** Role assignment happens only in admin Server Actions that explicitly verify `currentUser.role === 'admin'` first.
+- **NEVER add a new Supabase table without role-aware RLS policies.** Every tenant-owned table gets `enable row level security` plus a `using (author_id = auth.uid()::text or auth.role() = 'admin')` policy. CI grep enforces both halves.
+- **NEVER list/get/update/delete a Mastra resource without going through `mastraFor`.** The factory adds the `authorId` filter for users and skips it for admins; bypassing it is a defense-in-depth violation even when RLS would still catch it.
+- **NEVER perform an admin-only operation without an explicit `if (currentUser.role !== 'admin') throw new AdminRequiredError()` check** at the entry of the Server Action / Route Handler. The factory will already gate the implementation, but the explicit check makes intent visible at the call site.
 
 ### Architecture
 - **Don't rebuild what Mastra provides** — use built-in memory, storage, observability, editor, workspace. No custom implementations.

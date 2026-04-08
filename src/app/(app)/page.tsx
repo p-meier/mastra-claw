@@ -9,7 +9,7 @@ import {
   ZapIcon,
 } from "lucide-react"
 
-import { AppSidebar } from "@/components/app-sidebar"
+import { SignOutButton } from "@/components/sign-out-button"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
+import { requireAdmin } from "@/lib/auth"
 
 const stats = [
   {
@@ -97,10 +98,14 @@ const statusVariant: Record<
   failed: "destructive",
 }
 
-export default function DashboardPage() {
+export default async function DashboardPage() {
+  // The (app) layout already enforces requireAdmin(), but we keep the
+  // explicit assertion at the call site per the CLAUDE.md "defense-in-depth"
+  // rule. Cached via React.cache, so it's a no-op call.
+  await requireAdmin()
+
   return (
     <>
-      <AppSidebar />
       <SidebarInset>
         <header className="flex h-16 shrink-0 items-center gap-3 px-6">
           <SidebarTrigger className="-ml-2" />
@@ -111,10 +116,13 @@ export default function DashboardPage() {
                 Overview of your agents, workflows, and runs
               </span>
             </div>
-            <Button size="sm">
-              <PlusIcon />
-              New Agent
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="sm">
+                <PlusIcon />
+                New Agent
+              </Button>
+              <SignOutButton />
+            </div>
           </div>
         </header>
 

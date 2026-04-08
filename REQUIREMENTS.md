@@ -56,7 +56,42 @@ The full implementation of this principle — `authorId` on every stored resourc
 
 ---
 
-## 0c. Core Principle — Server-Only Execution Boundary
+## 0c. Core Principle — Role-Based Authorization
+
+**MastraClaw is role-aware from day one.** The system distinguishes between two roles — `'user'` and `'admin'` — even though Phase 1 only ever has Patrick (in the `admin` role). Roles are not a Phase 2 feature added later; they are part of the data model, the authorization layer, and the database policies from the very first migration.
+
+Why this matters as a core principle:
+
+- **Enterprise readiness requires role separation.** Any deployment beyond a one-person setup needs at minimum a "system administrator who can see and manage everything" and an "ordinary user who only sees their own data". These two roles are the foundation of every multi-user product, and retrofitting them later means rewriting every database policy, every wrapper call, and every UI assumption.
+- **Cost is small, retrofit cost is large.** Adding the role concept now is roughly one column in the JWT claim, one extra clause in every RLS policy, and one factory function. Adding it later is a project.
+
+What this means for the product:
+
+- Every authenticated user has exactly one role: `'user'` or `'admin'`. The role is stored in `auth.users.app_metadata.role` (Supabase's app-controlled metadata, not user-controlled), so users cannot promote themselves.
+- Users see, create, modify, and delete **only their own** resources (agents, prompts, skills, MCP connections, scorers, conversations, secrets).
+- Admins see, create, modify, and delete **any** resource across all users. They additionally have access to admin-only operations: list all users, invite new users, change a user's role, impersonate a user (for support/debugging).
+- All authorization decisions are made server-side. The role is read from the JWT, never sent from the client. CI enforces that no Server Action or Route Handler with admin-only logic skips the explicit role check.
+- Postgres Row-Level Security policies enforce both tenancy and role at the database layer, independent of the application code. A bug in the application wrapper still cannot leak data across tenants or roles.
+
+What this means for the user experience in Phase 1:
+
+- Patrick is auto-provisioned as `admin` on first deploy (one-time SQL or onboarding script setting `app_metadata.role = 'admin'`).
+- The web UI does **not** show role selectors, "Switch to user view" toggles, or a "Manage Users" page in Phase 1 — there is only one user, no UX for users-as-a-list is needed.
+- Patrick's experience is that of a single-user system. The role plumbing is invisible to him.
+
+What changes when user #2 arrives later:
+
+- A signup or invite form is added (Server Action calls `supabase.auth.admin.inviteUserByEmail()` with `app_metadata: { role: 'user' }`).
+- A "Users" tab appears in the admin area, visible only to admins.
+- Optionally: a "promote to admin" action.
+
+**No data migration. No RLS rewrite. No factory rewrite. No security audit.** The foundation is already correct.
+
+The full implementation pattern — `CurrentUser` type, `getCurrentUser()` helper, `mastraFor(currentUser)` factory with `userMastra` and `adminMastra` facades, role-aware RLS policies — is documented in `ARCHITECTURE.md` §4 and §4.8.
+
+---
+
+## 0d. Core Principle — Server-Only Execution Boundary
 
 **Mastra runs only on the server. Never in the browser. Never in any client bundle.**
 
@@ -569,8 +604,9 @@ Paperclip is an orchestration layer for managing external agents as employees. M
 ## Priority Tiers
 
 ### Tier 1 — MVP (Base Personal Agent)
-- **Multi-tenancy foundation** (Section 0b — `authorId`, `scopedMastra`, RLS, server-only boundary — even though only one user exists)
-- **Server-only execution boundary** (Section 0c — CI-enforced, no Mastra in client bundles)
+- **Multi-tenancy foundation** (Section 0b — `authorId` on every Mastra resource, `mastraFor(currentUser)` factory, role-aware RLS — even though only one user exists)
+- **Role-based authorization** (Section 0c — `'user' | 'admin'` roles via `app_metadata`, role-aware RLS policies, `getCurrentUser()` helper, admin facade with `listAllUsers` / `setUserRole` / `impersonate`, even though Patrick is the only admin)
+- **Server-only execution boundary** (Section 0d — CI-enforced, no Mastra in client bundles)
 - **Human-in-the-Loop** (approval gates for all destructive actions)
 - **Main Agent** (code-defined orchestrator) + ability to bind sub-agents to dedicated Telegram bots (Section 3.2)
 - Supabase backend (Postgres + pgvector + Storage + Auth + Vault) per `ARCHITECTURE.md`

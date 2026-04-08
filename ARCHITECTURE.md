@@ -129,18 +129,116 @@ Supabase is the **single** managed dependency of the project. It provides everyt
 
 - **Doppler** — its Supabase sync targets Edge Function env vars, not Vault, and our Mastra runtime does not run in Edge Functions. Doppler-as-Layer-A is possible but adds a moving part for marginal benefit. Not in Phase 1.
 - **Convex** — was the original choice, replaced by Supabase for sovereignty (Postgres-as-standard, self-hostability) and Mastra adapter maturity.
-- **LibSQL** — works for local development but not chosen as production storage because it has no path to multi-tenant deployment.
 - **Supabase Edge Functions** — Mastra runs in the Next.js process, not in Deno. Edge Functions are not part of our architecture.
+
+### 3.3 Local development via the Supabase CLI
+
+There is **one architectural path**, used identically in development and in production. There is no degraded "local mode", no LibSQL fallback, no `MASTRA_CLAW_MODE` switch, no parallel implementation. The reason is that Postgres-specific features — RLS, pgsodium/Vault, pgvector, GoTrue Auth — are load-bearing for the security and authorization story; falling back to LibSQL would silently disable RLS, kill Vault, drop the JWT-based role check, and produce a system that *runs* but does not hold its security guarantees. That is worse than no local option at all.
+
+The right answer is to run **Supabase itself locally**. The official Supabase CLI ships a `supabase start` command that boots the entire Supabase stack on the developer's machine via Docker:
+
+- Real Postgres (with `pgvector`, `pgsodium`, all extensions)
+- Real GoTrue Auth (same JWT format, same `app_metadata` claim handling)
+- Real Storage with a built-in MinIO instance speaking the S3 API on a local endpoint
+- Real Studio UI on `http://localhost:54323`
+- Real `psql` access for migrations
+
+A developer's setup is:
+
+```bash
+# One-time prerequisites: Docker installed, Supabase CLI installed
+git clone …
+cd mastra-claw
+npm install
+npx supabase init     # creates supabase/ if not present
+npx supabase start    # boots the local stack (~30 s first time, ~5 s subsequent)
+cp .env.local.example .env.local   # already points at the local Supabase URLs
+npx supabase db push  # runs migrations into the local Postgres
+npm run dev
+```
+
+After `supabase start`, the CLI prints the local credentials (DB URL on `127.0.0.1:54322`, Storage S3 endpoint on `127.0.0.1:54321/storage/v1/s3`, anon key, service role key, JWT secret). These go into `.env.local` once.
+
+The application code reads exactly the same env vars in both environments. Local development hits a Postgres at `127.0.0.1:54322`; production hits a Postgres at `db.<project>.supabase.co:5432`. **The provider configuration in `src/mastra/index.ts` does not branch on environment** — it constructs `PostgresStore` and `S3Filesystem` once, with values that come from env.
+
+What this gives:
+
+- **Identical RLS in dev and prod.** A migration that passes locally either passes or doesn't pass in production for reasons that are not "the engines disagree".
+- **Identical Vault in dev and prod.** Secrets are encrypted at rest on the developer's laptop the same way they are in production.
+- **Identical Auth in dev and prod.** Magic Links, OAuth, JWT claims — all work locally because GoTrue is running in the local stack.
+- **Identical S3 in dev and prod.** `@mastra/s3` connects to the local MinIO instance with the same SDK calls it uses against Supabase Storage.
+- **Real backups in dev.** `pg_dump` against `127.0.0.1:54322` works exactly as in production. Restore drills are reproducible without spinning up a throwaway cloud project.
+- **Zero parallel code paths.** No `if (mode === 'local')` branches, no two test suites, no degraded fallback to maintain.
+
+What this costs:
+
+- **Docker on the developer machine** is a hard prerequisite. Anyone working on MastraClaw runs Docker.
+- **`supabase start` takes ~30 seconds the first time** and ~5 seconds on subsequent boots. Negligible.
+- **Disk usage** for the Supabase Docker images: a few GB. Standard for any modern dev environment.
+
+There is no escape hatch for "I do not want Docker". A personal AI agent that holds the user's most sensitive data is not a project where the build setup gets cut to fit a developer's preference for zero external tools. The cost is one-time and small; the benefit is that the production architecture and the dev architecture are literally the same code running against literally the same software stack.
+
+#### CI
+
+CI uses `supabase start` exactly the same way. The CI job boots a local Supabase, runs migrations, runs the test suite against it, and tears it down. There is no need for a hosted Supabase project per branch.
+
+#### What we still do not use
+
+- **LibSQL** — neither in production nor in development. The complexity of supporting a second database engine is not justified by the marginal speedup.
+- **Convex** — replaced by Supabase as documented in §3.1.
+- **Doppler, Composio (Phase 1), separate API services** — as before.
 
 ---
 
-## 4. Multi-Tenancy as a Foundation
+## 4. Multi-Tenancy & Authorization
 
-This section is fundamental. **MastraClaw is a multi-tenant system that happens to ship Phase 1 with a single tenant.** Every line of database code is written as if the application has many users. There is no "single-user shortcut" anywhere.
+This section is fundamental. **MastraClaw is a multi-tenant, role-aware system that happens to ship Phase 1 with a single user (an admin).** Every line of database code is written as if the application has many users in multiple roles. There is no "single-user shortcut" and no "one-role shortcut" anywhere.
+
+Multi-tenancy and role-based authorization are two distinct, orthogonal concerns that we resolve at the same architectural layer:
+
+- **Tenancy** answers *whose data is this?* → enforced by `authorId` on every row + RLS comparing `author_id` to the authenticated user.
+- **Authorization** answers *what is this user allowed to do?* → enforced by an `app_metadata.role` claim in the JWT + RLS that grants admins broader access + an application-side factory that constructs the right Mastra facade per request.
+
+Both must be in place from day one. Retrofitting either later means rewriting every RLS policy, every wrapper call, and every UI assumption.
 
 ### 4.1 The user model
 
-Every authenticated request maps to exactly one `userId` (a UUID from Supabase Auth's `auth.users` table). This `userId` is the **tenant identifier**. There is no separate "tenant" or "org" concept in Phase 1 — one user equals one tenant. (If teams are needed later, an `Organization` entity can be added with users belonging to organizations; the `tenantId` then becomes `orgId` instead of `userId`. The code structure does not change.)
+Every authenticated request maps to exactly one user. A user is identified by:
+
+- **`userId`** — UUID from Supabase Auth's `auth.users` table. This is the **tenant identifier**: every Mastra resource owned by this user carries `authorId = userId`.
+- **`role`** — one of `'user' | 'admin'`, stored in `auth.users.raw_app_meta_data.role`. This is the **authorization identifier**: it determines whether the user sees only their own data or everyone's.
+
+The `role` lives in `raw_app_meta_data` (not `raw_user_meta_data`) deliberately. Supabase exposes these as two distinct JSONB columns:
+
+- `user_metadata` — user-controlled, can be modified by the user themselves via the client SDK. **Never store role here.**
+- `app_metadata` — application-controlled, can only be modified via the Supabase service role (server-only). Safe to store privileges here.
+
+Supabase automatically copies `app_metadata` into the issued JWT, so RLS policies and server-side code can read the role without an extra database round-trip.
+
+There is no separate "tenant" or "org" concept in Phase 1 — one user equals one tenant. (If teams are needed later, an `Organization` entity is added; `tenantId` becomes `orgId` instead of `userId`, and the role enum extends to `'user' | 'admin' | 'org_admin' | 'org_member'`. The code structure does not change.)
+
+A canonical type for the authenticated user, used everywhere in server-side code:
+
+```ts
+// src/lib/auth.ts
+export type UserRole = 'user' | 'admin';
+
+export type CurrentUser = {
+  userId: string;   // auth.users.id
+  email: string;
+  role: UserRole;
+};
+
+export async function getCurrentUser(): Promise<CurrentUser> {
+  const supabase = createServerClient();
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) throw new UnauthorizedError();
+  const role = (user.app_metadata?.role as UserRole | undefined) ?? 'user';
+  return { userId: user.id, email: user.email!, role };
+}
+```
+
+This is the **only** place in the application that reads the role from Supabase. Every other piece of code receives a `CurrentUser` object via parameter passing.
 
 ### 4.2 `authorId` on every Mastra resource
 
@@ -163,24 +261,34 @@ export type StorageListAgentsInput = {
 };
 ```
 
-**Mastra does not auto-fill `authorId`.** It is the application's responsibility to set it on every create and to filter on every list/get/update/delete. The `scopedMastra` wrapper makes this impossible to forget.
+**Mastra does not auto-fill `authorId`.** It is the application's responsibility to set it on every create and to filter on every list/get/update/delete. The `mastraFor` factory makes this impossible to forget.
 
-### 4.3 The `scopedMastra` wrapper
+### 4.3 The `mastraFor` factory (role-aware)
 
-A small abstraction lives in `src/mastra/lib/scoped-mastra.ts`. It takes the global `mastra` instance plus a `userId` and returns a per-request facade where every operation is automatically scoped to the user.
+A small abstraction lives in `src/mastra/lib/mastra-for.ts`. It takes a `CurrentUser` object (containing `userId` and `role`) and returns a per-request facade. The facade behaves differently depending on the role:
+
+- For `role === 'user'` it returns a **user-scoped** facade where every operation is automatically filtered by `authorId = userId` and ownership is asserted on every read/write.
+- For `role === 'admin'` it returns an **admin** facade where listing is unfiltered by default (admins see everything) and ownership assertions are skipped. The admin facade additionally exposes operations that only make sense for admins (`listAllUsers`, `impersonate`, etc.).
+
+Both facades expose the **same interface** for the operations that exist in both worlds, so application code that does not need admin-only methods can be written role-agnostic.
 
 ```ts
-// src/mastra/lib/scoped-mastra.ts
+// src/mastra/lib/mastra-for.ts
 import { mastra } from '@/mastra';
-import { ForbiddenError, NotFoundError } from './errors';
+import type { CurrentUser } from '@/lib/auth';
+import { ForbiddenError, NotFoundError, AdminRequiredError } from './errors';
 
-export function scopedMastra(userId: string) {
-  if (!userId) {
-    throw new Error('scopedMastra requires a userId — never call without authentication');
-  }
+export function mastraFor(user: CurrentUser) {
+  if (!user?.userId) throw new Error('mastraFor requires an authenticated user');
+  return user.role === 'admin' ? adminMastra(user) : userMastra(user);
+}
+
+// ─── User facade ─────────────────────────────────────────────────────────────
+function userMastra(user: CurrentUser) {
+  const userId = user.userId;
 
   return {
-    userId,
+    user,
 
     agent: {
       list: () =>
@@ -214,14 +322,73 @@ export function scopedMastra(userId: string) {
     scorer: { /* ... */ },
     workspace: { /* ... */ },
 
-    // For agent invocation, requestContext carries the userId so dynamic
+    // Agent invocation: requestContext carries userId + role so dynamic
     // tools / instructions / memory can scope themselves too.
     invoke: async (agentId: string, input: string) => {
       const a = await mastra.getAgentById(agentId);
       // assert ownership of stored agents (code-defined agents are global)
-      // ...
       return a.generate(input, {
-        requestContext: { userId },
+        requestContext: { userId, role: user.role },
+      });
+    },
+  };
+}
+
+// ─── Admin facade ────────────────────────────────────────────────────────────
+function adminMastra(user: CurrentUser) {
+  return {
+    user,
+
+    agent: {
+      // Admin: list everything by default. Optional filter to scope to one user.
+      list: (filter?: { authorId?: string }) =>
+        mastra.editor.agent.list(filter ?? {}),
+
+      // Admin: create on behalf of a user; the authorId must be passed explicitly.
+      create: (input: StorageCreateAgentInput) =>
+        mastra.editor.agent.create(input),
+
+      // Admin: read any agent, no ownership check.
+      get: (id: string) => mastra.editor.agent.get(id),
+      update: (id: string, patch: StorageUpdateAgentInput) =>
+        mastra.editor.agent.update(id, patch),
+      delete: (id: string) => mastra.editor.agent.delete(id),
+    },
+
+    prompt: { /* ... admin shape ... */ },
+    skill:  { /* ... admin shape ... */ },
+    mcp:    { /* ... admin shape ... */ },
+    scorer: { /* ... admin shape ... */ },
+    workspace: { /* ... admin shape ... */ },
+
+    // Admin can act as a specific user when needed (support, debugging).
+    // Returns a fresh user-scoped facade.
+    impersonate: (targetUserId: string, targetRole: UserRole = 'user') =>
+      mastraFor({ userId: targetUserId, email: '', role: targetRole }),
+
+    // Admin-only operations
+    listAllUsers: async () => {
+      const supabase = createServiceRoleClient();
+      const { data } = await supabase.auth.admin.listUsers();
+      return data.users.map(u => ({
+        userId: u.id,
+        email: u.email,
+        role: (u.app_metadata?.role as UserRole) ?? 'user',
+        createdAt: u.created_at,
+      }));
+    },
+
+    setUserRole: async (targetUserId: string, role: UserRole) => {
+      const supabase = createServiceRoleClient();
+      await supabase.auth.admin.updateUserById(targetUserId, {
+        app_metadata: { role },
+      });
+    },
+
+    invoke: async (agentId: string, input: string) => {
+      const a = await mastra.getAgentById(agentId);
+      return a.generate(input, {
+        requestContext: { userId: user.userId, role: 'admin' },
       });
     },
   };
@@ -234,59 +401,144 @@ async function assertOwned(ns: any, id: string, userId: string) {
 }
 ```
 
+The shape is verbose because both facades implement the same surface explicitly. This is on purpose: the type system catches any drift between the two implementations.
+
 ### 4.4 Usage rule: **never call `mastra.editor.*` directly from app code**
 
-In Server Components, Route Handlers, and Server Actions, the application code uses `scopedMastra(userId)`, never the raw `mastra` instance. The raw instance is reserved for:
+In Server Components, Route Handlers, and Server Actions, the application code calls:
+
+```ts
+const currentUser = await getCurrentUser();
+const m = mastraFor(currentUser);
+const myAgents = await m.agent.list();
+```
+
+The raw `mastra` instance is reserved for:
 
 - The Mastra initialization in `src/mastra/index.ts`
-- Internal scaffolding (migrations, seed scripts, admin tooling)
-- Code-defined agents and tools that legitimately need cross-user data (rare, must be reviewed)
+- The factory implementation in `src/mastra/lib/mastra-for.ts`
+- Internal scaffolding (migrations, seed scripts) — explicitly marked as admin-context
 
-A grep for `mastra.editor.` outside of `src/mastra/lib/scoped-mastra.ts` is a code-review red flag.
+Code-defined agents, tools, and workflows that legitimately need cross-user data (rare, must be reviewed) get the data via parameters from the calling layer — they do not reach into `mastra.editor.*` themselves.
 
-### 4.5 Defense in depth: Postgres RLS
+A grep for `mastra.editor.` outside of `src/mastra/lib/mastra-for.ts` and `src/mastra/index.ts` is a code-review red flag and should fail CI.
 
-The application-layer wrapper above is the first line of defense. The second line is **Postgres Row-Level Security**. Every Mastra table that stores per-tenant data gets an RLS policy:
+### 4.5 Defense in depth: Postgres RLS (role-aware)
+
+The application-layer factory above is the first line of defense. The second line is **Postgres Row-Level Security**. Every Mastra table that stores per-tenant data gets an RLS policy that combines tenancy and role:
 
 ```sql
 alter table mastra_agents enable row level security;
 
-create policy "tenant_isolation_mastra_agents"
+-- Helper: read role from JWT app_metadata claim
+create or replace function auth.role() returns text
+  language sql stable
+  as $$
+    select coalesce(
+      (auth.jwt() -> 'app_metadata' ->> 'role'),
+      'user'
+    );
+  $$;
+
+create policy "tenant_or_admin_mastra_agents"
   on mastra_agents
   for all
-  using (author_id = (select auth.uid())::text)
-  with check (author_id = (select auth.uid())::text);
+  using (
+    author_id = (select auth.uid())::text
+    or auth.role() = 'admin'
+  )
+  with check (
+    author_id = (select auth.uid())::text
+    or auth.role() = 'admin'
+  );
 ```
 
-The same pattern applies to `mastra_prompt_blocks`, `mastra_skills`, `mastra_mcp_clients`, `mastra_scorers`, `mastra_workspaces`, `mastra_memory_threads`, `mastra_memory_messages`, etc.
+This single policy enforces both rules at once: a user sees and modifies only their own rows, an admin sees and modifies any row. The same policy template applies to `mastra_prompt_blocks`, `mastra_skills`, `mastra_mcp_clients`, `mastra_scorers`, `mastra_workspaces`, `mastra_memory_threads`, `mastra_memory_messages`, the app `bindings` table, and any future tenant-owned table.
 
-This means: even if a bug in `scopedMastra` forgets to filter, **the database itself refuses to return rows that do not belong to the current authenticated user**. Two independent security layers, both enforced.
+This means: even if a bug in `mastraFor` forgets to filter, **the database itself refuses to return rows the JWT does not authorize**. Two independent security layers, both enforced.
 
-The exact list of Mastra tables and their RLS policies is generated by the migration script in `supabase/migrations/`. RLS is mandatory; a migration that adds a new Mastra table without RLS fails CI.
+The exact list of Mastra tables and their RLS policies is generated by the migration script in `supabase/migrations/`. RLS is mandatory; a migration that adds a new Mastra table without RLS-with-role-check fails CI.
 
 ### 4.6 Phase 1 vs. later
 
-In Phase 1, **only Patrick exists**. The system does not show a signup form, does not have org/team UI, does not have billing or quotas, does not display user names. But:
+In Phase 1, **only Patrick exists, and his role is `admin`**. The system does not show a signup form, does not have a "Manage Users" UI, does not have billing or quotas, does not display user names. But:
 
-- The first time Patrick logs in via Supabase Auth, his row in `auth.users` gets created (UUID `aaaa...`).
-- Every Mastra resource he creates is stamped with `authorId = aaaa...`.
-- Every query is filtered by `authorId = aaaa...`.
-- The `scopedMastra(userId)` wrapper is used everywhere.
+- On first deploy, Patrick's `auth.users` row is provisioned and his `app_metadata` is set to `{"role": "admin"}` via a one-time SQL migration or onboarding script.
+- Every Mastra resource he creates is stamped with `authorId = <his uuid>`.
+- Every query goes through `mastraFor(currentUser)`, which detects the admin role and returns the unfiltered admin facade. So Patrick sees everything — but there is only one author, so "everything" equals "his stuff" anyway.
+- RLS policies are role-aware from day 1. They allow admin to read any row, and Patrick happens to be the only admin.
 
-When user #2 arrives later, the only changes are:
-- Show a signup form
-- Maybe add user-name display in the UI
-- Maybe add organization grouping
+When user #2 arrives later, the changes are:
 
-**No data migration. No query rewrites. No security audit.** Because the foundation was multi-tenant from the start.
+1. Add a signup or invite form (Server Action calling `supabase.auth.admin.inviteUserByEmail()` with `app_metadata: { role: 'user' }`).
+2. Add a "Users" page in the admin area (a Server Component that calls `m.listAllUsers()` if `currentUser.role === 'admin'`, else returns 404).
+3. Optionally: a "promote to admin" action for the second admin.
+
+**No data migration. No RLS rewrite. No security audit. No factory rewrite.** The foundation is already correct.
 
 ### 4.7 What to never do in Phase 1 (because it would break the foundation)
 
-- ❌ Hardcoding `userId = 'patrick'` in any function. Always derive from Supabase Auth.
-- ❌ Calling `mastra.editor.agent.list()` without `authorId`. Always go through `scopedMastra`.
-- ❌ Skipping RLS on a new table because "we only have one user anyway".
+- ❌ Hardcoding `userId = 'patrick'` or `role = 'admin'` in any function. Always derive from Supabase Auth via `getCurrentUser()`.
+- ❌ Calling `mastra.editor.agent.list()` without going through `mastraFor`. Always use the factory.
+- ❌ Skipping RLS on a new table because "we only have one user anyway". Every tenant table needs the role-aware RLS template.
+- ❌ Writing RLS policies that compare only `author_id = auth.uid()` without the `or auth.role() = 'admin'` clause. Two-rule policy is the only allowed pattern.
+- ❌ Reading the role from `user_metadata` instead of `app_metadata`. Users could rewrite `user_metadata` themselves.
 - ❌ Storing secrets globally instead of per-user in Vault.
 - ❌ Naming a workspace path with a fixed name instead of `users/{userId}/...`.
+- ❌ Setting `app_metadata.role` from anywhere except a server-side admin endpoint (`supabase.auth.admin.updateUserById()` with the service-role client).
+- ❌ Sending the role from the client to the server. The server reads it from the JWT itself; never trust a client-supplied role.
+
+### 4.8 Roles & RBAC — the design in one place
+
+This subsection collects the role-related decisions for quick reference.
+
+**Roles in Phase 1:** exactly two — `'user'` and `'admin'`. No fine-grained permissions, no role hierarchy beyond this. If a finer model is ever needed (e.g., `'org_admin'`, `'billing'`, `'auditor'`), the storage and the JWT claim are already strings, so adding more roles is purely a code change in the factory and the RLS policies.
+
+**Where the role is stored:** `auth.users.raw_app_meta_data.role`, a JSONB field that Supabase exposes as part of the JWT claim under `app_metadata.role`. This is **app-controlled** (writable only via the service-role client) and therefore tamper-proof from the user's perspective.
+
+**Where the role is read:**
+
+| Layer | How |
+|---|---|
+| RLS policies (database) | `auth.jwt() -> 'app_metadata' ->> 'role'`, wrapped in the `auth.role()` SQL function defined in §4.5 |
+| Server-side TypeScript | `getCurrentUser()` in `src/lib/auth.ts`, which reads `user.app_metadata?.role` from Supabase Auth |
+| Mastra runtime context | `requestContext: { userId, role }` propagated by `mastraFor` into agent invocations, so dynamic tools/instructions can be role-aware |
+| Client-side TypeScript | **Never directly.** The client may receive a `role` field as part of a non-sensitive UI hint (e.g., to show or hide an "Admin" tab), but this is purely cosmetic. Authorization decisions are always server-side. |
+
+**Where the role is written:**
+
+- Initial admin provisioning: a one-time SQL migration sets Patrick's `app_metadata.role = 'admin'`.
+- Future invites: the admin facade's `setUserRole(userId, role)` method, which calls `supabase.auth.admin.updateUserById()` with the service-role client. This is a server-only operation; the service-role key never leaves the server.
+- Self-promotion is impossible: a regular user cannot change their own `app_metadata`.
+
+**Authorization decisions in code:** always at the boundary, never inside business logic. A Server Action that performs an admin-only operation starts with:
+
+```ts
+'use server';
+import { getCurrentUser } from '@/lib/auth';
+import { mastraFor } from '@/mastra/lib/mastra-for';
+import { AdminRequiredError } from '@/mastra/lib/errors';
+
+export async function listAllUsers() {
+  const currentUser = await getCurrentUser();
+  if (currentUser.role !== 'admin') throw new AdminRequiredError();
+  const m = mastraFor(currentUser); // returns admin facade
+  return m.listAllUsers();
+}
+```
+
+The role check is **explicit** at the entry of every admin-only Server Action / Route Handler. The factory will already return an admin facade because the role says so, but the explicit check makes the intent visible at the call site and provides a single, greppable enforcement point.
+
+**Why not use a separate RBAC service (Casbin, OpenFGA, Permit.io)?**
+
+For two roles, Supabase native is sufficient and adds zero infrastructure. A dedicated RBAC system becomes worth its complexity only when you have **all** of:
+
+- More than ~5 distinct roles
+- Granular permissions (`agents.create`, `secrets.read`, `users.invite`, ...) instead of coarse roles
+- Multi-app deployments that need to share the same role definitions
+- Compliance requirements that mandate auditable permission checks
+
+None of this is Phase 1, Phase 2, or even Phase 3. If you eventually outgrow Supabase native, the migration is contained: replace the implementation behind `getCurrentUser()` to call your RBAC service and translate the result back into a `CurrentUser` object. The rest of the codebase does not change. This is exactly the same isolation principle as `SecretService` (§11.6).
 
 ---
 
@@ -423,7 +675,7 @@ After this, every message to that bot bypasses the Main Agent and goes straight 
 src/app/api/telegram/[bot]/route.ts   ← Telegram webhook entry, identifies bot account
 src/lib/channels/telegram/             ← outbound (sending messages, voice, files)
 src/lib/channels/router.ts             ← bindings resolution
-src/lib/channels/dispatch.ts           ← takes (userId, agentId, message) → invokes scopedMastra
+src/lib/channels/dispatch.ts           ← takes (currentUser, agentId, message) → invokes mastraFor
 ```
 
 Channels are **code**, not data. Adding a new channel type (Slack, Teams, WhatsApp) means writing a new adapter and shipping it via redeploy. But adding a new bot or routing rule for an existing channel type is data — Vault token + a row in `bindings`. No redeploy.
@@ -537,7 +789,7 @@ Mastra's `@mastra/editor` package provides CRUD + versioning for runtime-defined
 
 | Resource | Stored? | How added |
 |---|---|---|
-| Agents | ✅ | Web UI form ("Create Agent"), via `scopedMastra(userId).agent.create({...})` |
+| Agents | ✅ | Web UI form ("Create Agent"), via `mastraFor(currentUser).agent.create({...})` |
 | Prompt Blocks | ✅ | Web UI ("Prompt Library") |
 | Skills | ✅ | Web UI upload or in-browser Markdown editor |
 | MCP Clients | ✅ | Web UI ("Connect MCP Server") |
@@ -564,7 +816,7 @@ const draftAgent = mastra.getAgentById('research-agent', { status: 'draft' });
 const v3 = mastra.getAgentById('research-agent', { versionId: 'v3-uuid' });
 ```
 
-The `scopedMastra(userId).invoke()` helper exposes a status/version override parameter so the web UI can show "test draft" buttons.
+The `mastraFor(currentUser).invoke()` helper exposes a status/version override parameter so the web UI can show "test draft" buttons.
 
 ---
 
@@ -870,7 +1122,8 @@ For production-grade observability across the rest of the stack (Next.js, channe
 | Scorers | `src/mastra/scorers/` | Code (redeploy) |
 | Channel adapters (Telegram, voice, web) | `src/lib/channels/` | Code (redeploy) |
 | Built-in skills (shipped baseline) | `src/mastra/skills/built-in/` | Code (redeploy), copied to user workspace at onboarding |
-| `scopedMastra` wrapper | `src/mastra/lib/scoped-mastra.ts` | Code (redeploy) |
+| `mastraFor` factory (role-aware) | `src/mastra/lib/mastra-for.ts` | Code (redeploy) |
+| `getCurrentUser()` helper | `src/lib/auth.ts` | Code (redeploy) |
 | `SecretService` | `src/mastra/lib/secret-service.ts` | Code (redeploy) |
 | Stored agents (user-created) | Supabase Postgres (Mastra storage) | Runtime |
 | Prompt blocks | Supabase Postgres (Mastra storage) | Runtime |
@@ -902,10 +1155,14 @@ This is the actionable plan for getting Phase 1 to a working state. Each item is
 
 ### 17.2 Multi-tenancy foundation
 - [ ] Create `supabase/migrations/0001_enable_rls.sql` that enables RLS and adds tenant policies on every Mastra table the storage adapter created (`mastra_agents`, `mastra_prompt_blocks`, `mastra_skills`, `mastra_mcp_clients`, `mastra_scorers`, `mastra_workspaces`, `mastra_memory_threads`, `mastra_memory_messages`, ...).
-- [ ] Create `src/mastra/lib/scoped-mastra.ts` exactly as sketched in §4.3.
-- [ ] Create `src/mastra/lib/errors.ts` with `ForbiddenError`, `NotFoundError`.
+- [ ] Create `src/lib/auth.ts` with `CurrentUser`, `UserRole`, and `getCurrentUser()` per §4.1.
+- [ ] Create `src/mastra/lib/mastra-for.ts` exactly as sketched in §4.3 (factory + `userMastra` + `adminMastra`).
+- [ ] Create `src/mastra/lib/errors.ts` with `ForbiddenError`, `NotFoundError`, `UnauthorizedError`, `AdminRequiredError`.
+- [ ] Migration `0002_role_aware_rls.sql` defining `auth.role()` SQL helper (§4.5) and applying the `tenant_or_admin_*` policies on every Mastra table.
+- [ ] One-time admin provisioning: SQL or onboarding script that sets `auth.users.raw_app_meta_data = '{"role": "admin"}'` for Patrick on first login.
 - [ ] Add an ESLint rule (or a CI grep) that fails the build when a file with `'use client'` imports from `@/mastra` or `@mastra/*`.
-- [ ] Add a CI grep that fails the build when `mastra.editor.` is referenced outside of `src/mastra/lib/scoped-mastra.ts` or `src/mastra/index.ts`.
+- [ ] Add a CI grep that fails the build when `mastra.editor.` is referenced outside of `src/mastra/lib/mastra-for.ts` or `src/mastra/index.ts`.
+- [ ] Add a CI grep that fails the build when an RLS-policy migration omits the `auth.role() = 'admin'` clause for tenant tables.
 
 ### 17.3 Auth
 - [ ] Configure Supabase Auth in the Supabase dashboard. Magic Link is sufficient for Phase 1.
@@ -922,7 +1179,7 @@ This is the actionable plan for getting Phase 1 to a working state. Each item is
 ### 17.5 The Main Agent
 - [ ] Create `src/mastra/agents/main-agent.ts` as a code-defined agent. Sensible default model. Empty sub-agent list initially.
 - [ ] Register the Main Agent in `src/mastra/index.ts`.
-- [ ] Create a server-only chat Route Handler (`src/app/api/chat/route.ts`) that uses `scopedMastra(userId).invoke('main-agent', message)`.
+- [ ] Create a server-only chat Route Handler (`src/app/api/chat/route.ts`) that uses `mastraFor(currentUser).invoke('main-agent', message)`.
 - [ ] Create a minimal client chat UI that posts to that route.
 
 ### 17.6 Channels

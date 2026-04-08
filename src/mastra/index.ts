@@ -1,27 +1,51 @@
-import { resolve } from 'node:path';
 import { Mastra } from '@mastra/core/mastra';
+import { MastraAuthSupabase } from '@mastra/auth-supabase';
 import { MastraEditor } from '@mastra/editor';
 import { PinoLogger } from '@mastra/loggers';
-import { LibSQLStore } from '@mastra/libsql';
 import {
   Observability,
   DefaultExporter,
   SensitiveDataFilter,
 } from '@mastra/observability';
 
-// Absoluter Pfad relativ zum Projekt-Root, damit `next dev` und `mastra dev`
-// (die aus unterschiedlichen Working-Directories starten) dieselbe DB nutzen.
-const dbPath = resolve(process.cwd(), 'mastra.db');
+import { env } from '@/lib/env';
+import { storage } from './storage';
+
+/**
+ * Auth provider for the Mastra HTTP server (Mastra Studio on :4111, plus any
+ * direct `/api/agents/...` endpoints exposed by `mastra start`).
+ *
+ * This does NOT gate Next.js Server Actions / Route Handlers — those run
+ * in-process and will go through `mastraFor(currentUser)` (added later) for
+ * their own role-aware authorization.
+ *
+ * The default `authorizeUser` in MastraAuthSupabase checks a `users.isAdmin`
+ * column in the public schema, which we deliberately don't have. Per
+ * ARCHITECTURE.md §6 / CLAUDE.md, roles live in `auth.users.raw_app_meta_data.role`
+ * (exposed as `user.app_metadata.role` on the Supabase User object). Phase 1
+ * ships with a single admin (Patrick); everyone else is rejected.
+ */
+const auth = new MastraAuthSupabase({
+  url: env.NEXT_PUBLIC_SUPABASE_URL,
+  anonKey: env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+  authorizeUser: (user) => {
+    const role = (user.app_metadata as { role?: string } | undefined)?.role;
+    return role === 'admin';
+  },
+});
 
 export const mastra = new Mastra({
   agents: {},
   workflows: {},
   scorers: {},
   editor: new MastraEditor(),
-  storage: new LibSQLStore({
-    id: 'mastra-storage',
-    url: `file:${dbPath}`,
-  }),
+  // Mastra calls storage.init() automatically and creates its mastra_*
+  // tables on first request. PgVector is added later, attached to a Memory
+  // instance — not at the top level.
+  storage,
+  server: {
+    auth,
+  },
   logger: new PinoLogger({
     name: 'Mastra',
     level: 'info',

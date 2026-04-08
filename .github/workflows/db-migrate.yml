@@ -1,0 +1,86 @@
+name: Apply DB Migrations
+
+# Applies pending Supabase migrations to the production project whenever
+# someone merges to main and the migration files actually changed.
+#
+# This is the only sanctioned way to ship schema changes. Direct SQL via
+# the dashboard or via a local `supabase db push` is forbidden — it would
+# diverge from the migration history that lives in
+# `supabase_migrations.schema_migrations` and break future deploys.
+#
+# Required GitHub repository secrets:
+#   SUPABASE_ACCESS_TOKEN     personal access token (Account → Tokens)
+#   SUPABASE_DB_PASSWORD      production database password
+#   SUPABASE_PROJECT_ID       project ref (e.g. bscjrirbspiogrfalxyr)
+#
+# Required GitHub repository variables (optional, for the lint job):
+#   none
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/config.toml'
+      - '.github/workflows/db-migrate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+  workflow_dispatch: {}
+
+# Never run two migration jobs at the same time on the same project — would
+# race on schema_migrations and either deadlock or apply out of order.
+concurrency:
+  group: db-migrate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # PR job: lint only, do NOT apply. Keeps the production DB untouched until
+  # the PR is merged. Once Supabase Branching is enabled, replace this with
+  # a real preview-branch apply.
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Verify migrations parse
+        run: supabase db lint --linked
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        continue-on-error: false
+
+  # Production push: only on main branch.
+  apply:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Link to production project
+        run: supabase link --project-ref "$SUPABASE_PROJECT_ID"
+
+      - name: Show pending migrations
+        run: supabase migration list --linked
+
+      - name: Apply pending migrations
+        run: supabase db push --linked --include-all --yes
+
+      - name: Confirm migration history
+        run: supabase migration list --linked
