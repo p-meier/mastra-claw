@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { AlertCircleIcon } from 'lucide-react';
 
 import { getCurrentUser } from '@/lib/auth';
+import { mapAuthError } from '@/lib/auth-errors';
 
 import { signInAction } from './actions';
 
@@ -210,10 +211,10 @@ export default async function LoginPage({
               {params.error && (
                 <div
                   role="alert"
-                  className="animate-in fade-in flex items-start gap-2.5 rounded-lg border border-rose-500/20 bg-rose-500/[0.06] px-3.5 py-2.5 text-xs text-rose-200/90 duration-300"
+                  className="animate-in fade-in flex items-start gap-2.5 rounded-lg border border-rose-500/20 bg-rose-500/[0.06] px-3.5 py-2.5 text-xs leading-relaxed text-rose-200/90 duration-300"
                 >
                   <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0 text-rose-300" />
-                  <span>{decodeURIComponent(params.error)}</span>
+                  <span>{mapAuthError(params.error)}</span>
                 </div>
               )}
 
