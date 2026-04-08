@@ -1,59 +1,114 @@
 # MastraClaw — Claude Code Instructions
 
+> **Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) first.** It is the authoritative source for every architectural decision in this project: the single-process embedding of Mastra in Next.js, the Supabase backend, multi-tenancy as a foundation, the server-only execution boundary, the Main Agent + Sub Agents model, channel bindings, secrets management, and backups. When this file conflicts with `ARCHITECTURE.md`, `ARCHITECTURE.md` wins. This file is a working-level reference for day-to-day coding conventions.
+
 ## Project Overview
 
-MastraClaw is an enterprise-ready personal AI agent built on [Mastra.ai](https://mastra.ai). It provides an opinionated, curated base configuration that combines three architectural paradigms:
+MastraClaw is an enterprise-ready personal AI agent built on [Mastra.ai](https://mastra.ai). It is a **single-process Next.js application** that embeds Mastra directly via TypeScript imports — there is no separate API server. All persistent state lives in Supabase (Postgres + Storage + Auth + Vault + pgvector); the compute layer is fully disposable.
 
-1. **Skill-based** — Agent capabilities defined as markdown SOPs, flexible and learnable
-2. **Workflow-based** — Hard-coded multi-step workflows with durable execution (Mastra workflows)
-3. **Hybrid** — Orchestrator agents delegate to specialists and use workflows-as-tools
+The agent model is **one Main Agent and many Sub Agents**:
 
-The hybrid approach is the primary pattern. It solves the compound error problem (95% per-step accuracy degrades to 36% after 20 steps) by encapsulating multi-step operations in reliable workflows that appear as single tool calls to agents.
+- The **Main Agent** (code-defined) is the user's primary point of contact and conceptually the orchestrator. It owns the default Telegram bot, the default Web UI chat, and the default voice interface. It can delegate work to sub-agents.
+- **Sub Agents** are specialized: research, finance, scheduling, content creation, etc. Some are code-defined (shipped in `src/mastra/agents/`), some are stored in the database and created by the user via the web UI. Sub-agents can be reached **indirectly** through the Main Agent's delegation **or directly** through their own bound channel (e.g., a dedicated Telegram bot per sub-agent). Routing is configured via a `bindings` table in Postgres, not hardcoded.
+
+The architecture combines three implementation paradigms:
+
+1. **Skill-based** — Agent capabilities defined as Markdown SOPs in S3-backed workspaces, flexible and learnable
+2. **Workflow-based** — Multi-step durable workflows in code (Mastra workflows in `src/mastra/workflows/`)
+3. **Hybrid (primary)** — Main Agent delegates to specialists, workflows-as-tools encapsulate complex operations as single tool calls
+
+The hybrid pattern solves the compound error problem (95% per-step accuracy degrades to 36% after 20 steps) by wrapping multi-step operations in reliable workflows.
 
 ## Tech Stack
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Agent Framework | Mastra.ai | Agents, workflows, tools, memory, observability |
-| Config Dashboard | Next.js | Web UI for agent configuration and monitoring |
-| Database | Convex.dev | Reactive database, vector search, durable functions |
-| Voice | ElevenLabs | Text-to-speech and speech-to-text |
-| Channels | [Vercel Chat SDK](https://chat-sdk.dev) | Unified multi-platform channel layer (Slack, Teams, Telegram, Discord, etc.) |
-| Model Routing | [Vercel AI SDK](https://sdk.vercel.ai) + AI Gateway | Model-agnostic provider abstraction, supports OpenRouter, private APIs |
-| Durable Execution | [Inngest](https://www.inngest.com) / [Workflow SDK](https://useworkflow.dev) | External durable workflow orchestration, suspend/resume, step-level retries |
-| Observability | Langfuse, Langsmith, OpenTelemetry | Tracing, metrics, debugging across agents and workflows |
-| Evaluations | Mastra Evals (`@mastra/evals`) | Built-in scorers for agent quality, hallucination, toxicity, tool accuracy |
-| MCP Integration | [Composio.dev](https://composio.dev) + Mastra MCP Client/Server | Aggregated MCP servers, secrets management, external tool access |
-| Validation | Zod | Schema validation for all inputs/outputs |
+| Agent Framework | Mastra.ai (`@mastra/core`, `@mastra/editor`, `@mastra/memory`, `@mastra/observability`) | Agents, workflows, tools, memory, observability, runtime resource CRUD |
+| Application Host | Next.js 16 (App Router) | Single deployment; Server Components / Route Handlers / Server Actions are the only place Mastra runs |
+| Database | Supabase Postgres via `@mastra/pg` | Mastra Storage, app tables, multi-tenant data |
+| Vector Store | pgvector (bundled in Supabase) via `@mastra/pg` | Embeddings for RAG and semantic recall |
+| Workspace Filesystem | Supabase Storage (S3 API) via `@mastra/s3` | Skill files, generated artifacts, per-agent workspaces |
+| Auth | Supabase Auth + `@supabase/ssr` | User identity, sessions, RLS subject |
+| Secrets | Supabase Vault (`pgsodium`) via `SecretService` | Per-user encrypted secrets (LLM keys, channel tokens, MCP auth) |
+| Voice | ElevenLabs (TTS), STT TBD | Voice I/O |
+| Channels | Custom adapters in `src/lib/channels/` (Telegram first) | Bindings table routes incoming messages to the right agent |
+| Model Routing | Mastra model router (`provider/model-name` strings) | Model-agnostic, supports OpenAI, Anthropic, OpenRouter, etc. |
+| Durable Execution | Mastra workflows in code; Inngest / Trigger.dev evaluated for Phase 2 | Multi-step orchestration |
+| Observability | `@mastra/observability` with `DefaultExporter` + `SensitiveDataFilter`, optional Langfuse | Tracing, redaction |
+| Evaluations | `@mastra/evals` | Built-in scorers |
+| MCP Integration | Mastra MCP client (stored MCP connections) | Dynamic tool acquisition without code changes |
+| Validation | Zod | Schema validation for all tool inputs/outputs and API boundaries |
 
-## Architecture
+**Explicitly not used:** Convex, LibSQL (production), Vercel Chat SDK, Doppler, Composio (Phase 1), separate API service.
+
+## Architecture (Summary)
+
+> Full version in [`ARCHITECTURE.md`](./ARCHITECTURE.md). This is the elevator pitch.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│            Channels (Slack, Teams, Telegram, ...)        │
-│                    via Vercel Chat SDK                   │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────┐
-│                  Orchestrator Agent                      │
-│  (strong model, memory, scoped tool assignment)           │
-└───┬──────────────┬──────────────┬───────────────────────┘
-    │              │              │
-    ▼              ▼              ▼
-┌────────┐  ┌──────────┐  ┌──────────────┐
-│Specialist│ │Specialist│  │  Workflow     │
-│ Agent A  │ │ Agent B  │  │  (as Tool)   │
-│(cheap    │ │(cheap    │  │  Multi-step  │
-│ model)   │ │ model)   │  │  Durable     │
-└────────┘  └──────────┘  └──────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│   Vercel / Railway — Next.js 16 + Mastra (one process)        │
+│                                                                │
+│   Server-only:  Server Components │ Route Handlers │ Actions  │
+│                          │              │             │       │
+│                          └──────────────┴─────────────┘       │
+│                                    │                          │
+│                          scopedMastra(userId)                  │
+│                                    │                          │
+│       ┌────────────────────────────┴──────────────────┐       │
+│       │            Mastra (in-process)                 │       │
+│       │  Main Agent ──delegates──▶ Sub Agents          │       │
+│       │       ▲                         ▲              │       │
+│       └───────┼─────────────────────────┼──────────────┘       │
+│               │                         │                      │
+│   Bindings table routes channels → agents (Postgres)           │
+│       │                         │                              │
+│   Telegram main bot         Telegram per-agent bots             │
+│   Web UI default chat       Voice / email / etc. (later)        │
+│                                                                │
+│   Layer A bootstrap secrets in process.env (~5 values)         │
+└─────────────────────────────┬─────────────────────────────────┘
+                              │ Postgres + S3 over TLS
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│   Supabase                                                     │
+│                                                                │
+│   Postgres (via @mastra/pg, RLS on every tenant table)         │
+│     ├ Mastra Storage (agents, prompts, skills, mcp, scorers)   │
+│     ├ pgvector (semantic recall, RAG)                          │
+│     ├ vault.secrets (per-user secrets — Layer B)               │
+│     └ App tables (bindings, user settings)                     │
+│                                                                │
+│   Storage (S3-compatible, via @mastra/s3)                      │
+│     └ users/{userId}/agents/{agentId}/  ← workspaces           │
+│                                                                │
+│   Auth (magic link / OAuth)                                    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Key patterns:**
-- **Orchestrator/Specialist** — One orchestrator (strong model) delegates to specialist sub-agents (cheaper models). Sub-agents get fresh context per task (context firewalls).
-- **Workflows-as-Tools** — Complex multi-step operations are coded as Mastra workflows and exposed as single tools to agents.
-- **Scoped Tool Assignment** — Each agent receives only the tools it actually needs. The orchestrator has its tools, each specialist gets exactly its required toolset — no unnecessary tool bloat.
-- **Human-in-the-Loop** — No destructive action without user approval. Mastra's suspend/resume enables approval gates at any workflow step. Approval requests propagate: sub-agent → orchestrator → user channel (Telegram/Teams/Web UI). Configurable trust levels per action type.
-- **4-Tier Memory** — Message History → Working Memory → Observational Memory → Semantic Recall.
+
+- **Server-only execution boundary (CRITICAL).** Mastra, secrets, LLM keys, and any privileged code live exclusively in Server Components, Route Handlers, and Server Actions. **Never** in Client Components, never in browser bundles, never in `NEXT_PUBLIC_*` env vars. Importing `@/mastra` or `@mastra/*` in a `'use client'` file is a security incident. CI must enforce this.
+
+- **Multi-tenant from day one.** Every database row carries an owner. The data model and authorization layer assume multiple users — Phase 1 just happens to ship with one. There are no single-user shortcuts anywhere.
+
+- **`scopedMastra(userId)` wrapper.** Application code never calls `mastra.editor.*` directly. It calls `scopedMastra(userId).agent.list()` (or `.get`, `.create`, `.update`, `.delete`, `.invoke`) which automatically scopes by `authorId`, asserts ownership, and propagates the user identity into Mastra via `requestContext`. The raw `mastra` instance is reserved for `src/mastra/index.ts` and admin scripts. A grep for `mastra.editor.` outside `src/mastra/lib/scoped-mastra.ts` is a red flag.
+
+- **Defense in depth with Postgres RLS.** On top of `scopedMastra`, every Mastra storage table and every app table has Row-Level Security policies that enforce `authorId = auth.uid()`. Two independent layers — bug in the wrapper still cannot leak data.
+
+- **Main Agent + Sub Agents with bindings-based routing.** The Main Agent handles general traffic on the default Telegram bot and Web UI. Sub-agents are reachable both indirectly (via Main Agent delegation) and directly (via dedicated Telegram bots whose tokens are stored in Vault and mapped via the `bindings` table). Adding a new direct sub-agent bot requires zero code: bot token in Vault + row in `bindings` + webhook registration.
+
+- **Code vs. Data — strict separation.** Workflows, code-defined tools, channel adapters, providers, the Main Agent, and any TypeScript live in Git and ship via redeploy. Stored agents, prompt blocks, skills (Markdown content), MCP connections, scorers, memory, conversations, and secrets live in Supabase and change at runtime via the web UI. No redeploy for the latter.
+
+- **Workflows-as-Tools.** Complex multi-step operations are coded as Mastra workflows and exposed as single tools to agents.
+
+- **Scoped Tool Assignment.** Each agent receives only the tools it actually needs. No tool bloat across agents.
+
+- **Human-in-the-Loop.** No destructive action without user approval. Mastra's suspend/resume enables approval gates at any workflow step. Approval requests propagate: sub-agent → main agent → user channel (Telegram / Web UI). Configurable trust levels per action type.
+
+- **4-Tier Memory.** Message History → Working Memory → Observational Memory → Semantic Recall.
+
+- **Disposable infrastructure.** The compute container holds no persistent state. Killing it and recreating it is a no-op. All state is in Supabase. Backup = `pg_dump` + `aws s3 sync`. Restore = new project + `psql < dump.sql`.
 
 ## Mastra Studio
 
@@ -142,28 +197,69 @@ Both options are complementary to Mastra's native workflows — use them for ext
 
 ## Project Structure
 
+Single Next.js application — no monorepo, no separate API service.
+
 ```
-mastraclaw/
-├── apps/
-│   ├── api/                          # Mastra backend
-│   │   └── src/mastra/
-│   │       ├── agents/               # Agent definitions
-│   │       │   ├── orchestrator.ts   # Main orchestrator agent
-│   │       │   └── specialists/      # Specialist sub-agents
-│   │       ├── workflows/            # Workflow definitions
-│   │       ├── tools/                # Tool definitions
-│   │       ├── scorers/              # Evaluation scorers
-│   │       └── index.ts              # Mastra initialization
-│   └── web/                          # Next.js config dashboard
-│       └── src/app/
-├── convex/                           # Convex database schema & functions
-│   ├── schema.ts
-│   └── ...
-├── CLAUDE.md                         # This file
+mastra-claw/
+├── ARCHITECTURE.md                   # Authoritative architecture (read first)
+├── CLAUDE.md                         # This file — coding conventions
+├── REQUIREMENTS.md                   # Product-level requirements
 ├── README.md
-├── package.json                      # Root workspace config
-└── tsconfig.json
+├── package.json
+├── tsconfig.json
+├── next.config.ts                    # serverExternalPackages: ['@mastra/*']
+├── .env.local                        # Layer A bootstrap secrets only
+│
+├── supabase/
+│   └── migrations/                   # SQL migrations: RLS, app tables, indexes
+│
+├── src/
+│   ├── mastra/
+│   │   ├── index.ts                  # The Mastra instance (single export)
+│   │   ├── agents/
+│   │   │   ├── main-agent.ts         # The Main Agent (code-defined)
+│   │   │   └── sub/                  # Code-defined sub-agents
+│   │   ├── workflows/                # Code-only workflows
+│   │   ├── tools/                    # Code-defined tools
+│   │   ├── scorers/                  # Evaluation scorers
+│   │   ├── skills/
+│   │   │   └── built-in/             # Markdown skills shipped by default
+│   │   └── lib/
+│   │       ├── scoped-mastra.ts      # Per-user wrapper (NEVER bypass)
+│   │       ├── secret-service.ts     # Vault-backed per-user secrets
+│   │       └── errors.ts
+│   │
+│   ├── lib/
+│   │   ├── supabase/
+│   │   │   ├── server.ts             # Server-only Supabase client
+│   │   │   └── client.ts             # Browser client (no Mastra ever)
+│   │   ├── channels/
+│   │   │   ├── router.ts             # Bindings resolution
+│   │   │   ├── dispatch.ts           # Hands resolved agent to scopedMastra
+│   │   │   └── telegram/             # Telegram in/out adapter
+│   │   └── auth.ts                   # getUserId() helper
+│   │
+│   ├── app/
+│   │   ├── (auth)/login/page.tsx     # Supabase Auth UI
+│   │   ├── (app)/                    # Authenticated pages (Server Components)
+│   │   │   ├── chat/page.tsx         # Web chat with the Main Agent
+│   │   │   ├── agents/page.tsx       # Agent management
+│   │   │   ├── skills/page.tsx       # Skill management
+│   │   │   └── settings/             # Settings + setup wizard
+│   │   ├── api/
+│   │   │   ├── chat/route.ts         # Server-only: invokes scopedMastra
+│   │   │   ├── telegram/[bot]/route.ts  # Telegram webhook (per bot)
+│   │   │   └── ...
+│   │   ├── layout.tsx
+│   │   └── globals.css
+│   │
+│   └── components/                   # UI components — pure presentation
+│       └── ...
+│
+└── public/
 ```
+
+**Critical rule:** any file under `src/components/` or any file with `'use client'` directive **must not** import from `@/mastra` or `@mastra/*`. Server-only logic stays in `src/mastra/**`, `src/app/**/page.tsx`, `src/app/**/route.ts`, and Server Action files. CI enforces this.
 
 ## Coding Conventions
 
@@ -243,58 +339,77 @@ const tool = createTool({
 
 ```bash
 # Development
-npm run dev              # Run both API + web concurrently
-npm run dev:api          # Mastra API only (default: port 4111)
-npm run dev:web          # Next.js dashboard only (default: port 3000)
+npm run dev              # Next.js dev server (Mastra is embedded, not a separate process)
+npm run dev:studio       # Mastra Studio (separate dev process, same DB) at http://localhost:4111
 
-# Build
-npm run build            # Build both workspaces
+# Build & run
+npm run build            # next build
+npm run start            # next start
 
-# Mastra Studio
-# Automatically available at http://localhost:4111 during dev
+# Lint
+npm run lint
 ```
 
-## Environment Variables
+## Backup & Restore
+
+The compute layer holds **no persistent state**. Every byte that matters lives in Supabase. This is a deliberate architectural decision so backups are simple and the server is disposable.
+
+**Backup set:**
+- `pg_dump` of Supabase Postgres → captures Mastra state, app tables, embeddings, and Vault ciphertexts (Vault secrets are encrypted at rest inside the dump — the encryption key never touches the file)
+- `aws s3 sync` of the Supabase Storage bucket → captures workspace files, skill content, generated artifacts
+- Layer A bootstrap secrets (~5 values) backed up separately in 1Password / Bitwarden
+
+**Daily backup (sketch):**
+```bash
+pg_dump --no-owner --no-acl "$DATABASE_URL" | gzip > "backup-$(date +%F).sql.gz"
+aws s3 sync "s3://workspaces" "./backup-storage-$(date +%F)/" \
+  --endpoint-url "https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/s3"
+rclone copy ./backup-* "$OFFSITE_REMOTE:mastra-claw-backups/"
+```
+
+**Restore (sketch):**
+```bash
+gunzip -c backup-2026-04-08.sql.gz | psql "$NEW_DATABASE_URL"
+aws s3 sync ./backup-storage-2026-04-08/ "s3://workspaces" \
+  --endpoint-url "https://${NEW_PROJECT_REF}.supabase.co/storage/v1/s3"
+# update host env vars with new Supabase credentials
+# redeploy from Git
+```
+
+**Rules for code that touches the backup story:**
+- Never introduce a second persistence layer (no SQLite alongside Postgres, no local file cache that holds canonical state, no in-memory state that survives across requests as source-of-truth).
+- Never store secrets in env vars when they could go in Vault — env vars are not in the Postgres dump.
+- Never write workspace files outside the S3-backed `Workspace` filesystem; local-disk writes are lost on every redeploy.
+- New tables in Supabase migrations must work with `pg_dump`/`psql` restore out of the box. No exotic Postgres features that break dump/restore.
+- The restore drill is part of the operations runbook (`docs/runbook-restore.md`) and runs quarterly.
+
+Full backup architecture, rationale, and integrity-test procedure: [`ARCHITECTURE.md`](./ARCHITECTURE.md) §12.
+
+## Environment Variables — Layer A (Bootstrap Only)
+
+These are the **only** secrets that live in `process.env`. They are the bare minimum for the system to start, configured manually on Vercel / Railway / your host. Everything else is in Supabase Vault and read at runtime via `SecretService` (per user).
 
 ```bash
-# === Model Providers (at least one required) ===
-ANTHROPIC_API_KEY=           # Anthropic Claude
-OPENAI_API_KEY=              # OpenAI
-# Add any Vercel AI SDK compatible provider
+# === Supabase (mandatory) ===
+DATABASE_URL=                       # postgres://... (full Postgres connection)
+SUPABASE_PROJECT_REF=               # project reference, used to build URLs
+SUPABASE_ANON_KEY=                  # anon key for client-side Supabase Auth
+SUPABASE_SERVICE_ROLE_KEY=          # service role key — server-side only, NEVER NEXT_PUBLIC_
+SUPABASE_S3_ACCESS_KEY_ID=          # for @mastra/s3 against Supabase Storage
+SUPABASE_S3_SECRET_ACCESS_KEY=      # for @mastra/s3 against Supabase Storage
 
-# === Model Selection ===
-ORCHESTRATOR_MODEL=          # e.g., anthropic/claude-sonnet-4-20250514
-SPECIALIST_MODEL=            # e.g., anthropic/claude-haiku-4-5-20251001
-
-# === Mastra ===
-MASTRA_API_KEY=              # API authentication token
-
-# === Convex ===
-CONVEX_URL=                  # Convex deployment URL
-CONVEX_DEPLOY_KEY=           # Convex deploy key
-
-# === Observability ===
-LANGFUSE_PUBLIC_KEY=         # Langfuse public key
-LANGFUSE_SECRET_KEY=         # Langfuse secret key
-LANGFUSE_BASE_URL=           # Langfuse instance URL (self-hosted or cloud)
-LANGSMITH_API_KEY=           # LangSmith API key (alternative to Langfuse)
-
-# === Durable Execution ===
-INNGEST_EVENT_KEY=           # Inngest event key
-INNGEST_SIGNING_KEY=         # Inngest signing key
-
-# === Composio ===
-COMPOSIO_API_KEY=            # Composio.dev API key for MCP aggregation
-
-# === Telegram ===
-TELEGRAM_BOT_TOKEN=          # Telegram Bot API token
-TELEGRAM_ALLOWED_USER_ID=    # Authorized user ID(s)
-
-# === ElevenLabs ===
-ELEVENLABS_API_KEY=          # ElevenLabs API key
-ELEVENLABS_VOICE_ID=         # Voice ID for TTS
-ELEVENLABS_MODEL_ID=         # Model ID (default: eleven_v3)
+# === Optional: model defaults (override via stored agent config) ===
+MAIN_AGENT_MODEL=                   # e.g., anthropic/claude-sonnet-4-5
+SPECIALIST_MODEL=                   # e.g., anthropic/claude-haiku-4-5
 ```
+
+**Forbidden:**
+- `NEXT_PUBLIC_*` for any of the above. The service role key in particular must never reach the browser.
+- LLM provider API keys in env vars. They go in Vault, scoped per user. The user enters them in the setup wizard on first login.
+- Telegram bot tokens in env vars. They go in Vault, scoped per user.
+- Any other "user-level" secret in env vars.
+
+This separation is documented in detail in `ARCHITECTURE.md` §11 (Secrets — Two Layers).
 
 ## Security & Compliance
 
@@ -327,12 +442,29 @@ Processors are composable and can be stacked. Apply them as input processors (pr
 
 ## Do NOT
 
-- **Rebuild what Mastra provides** — Use built-in memory, storage, observability, channels. Don't create custom implementations
-- **Use `any` type** — Always define proper types or use `unknown` with narrowing
-- **Skip Zod schemas** — Every tool, workflow step, and API boundary needs schema validation
-- **Hardcode model names** — Always use ENV vars with sensible defaults
-- **Give agents unnecessary tools** — Each agent gets only the tools it needs. Don't share tool sets across agents or load tools "just in case"
-- **Create role-based sub-agents** — Use context firewalls (fresh agent per task), not specialized role agents ("Frontend-Agent")
-- **Write verbose agent instructions** — Concise, human-written instructions outperform long LLM-generated ones (ETH Zurich finding)
-- **Skip `workflow.commit()`** — Every workflow definition must call `.commit()` after step chain
-- **Store secrets in code or config files** — Use environment variables exclusively
+### Security boundary (highest priority)
+- **NEVER import `@/mastra` or `@mastra/*` in any file with `'use client'`.** Mastra is server-only. CI must enforce this.
+- **NEVER use `NEXT_PUBLIC_*` for anything secret.** Service role keys, LLM API keys, bot tokens, S3 secrets — none of these may ever reach the browser.
+- **NEVER call LLM providers or execute Mastra code from a Client Component.** Client → Server Action / Route Handler → Mastra. Always.
+- **NEVER store user secrets (LLM keys, bot tokens, etc.) in env vars.** They go in Supabase Vault, scoped per user via `SecretService`.
+
+### Multi-tenancy (foundation)
+- **NEVER call `mastra.editor.*` directly from application code.** Always go through `scopedMastra(userId)`. The raw instance is reserved for `src/mastra/index.ts` and admin scripts. CI greps for violations.
+- **NEVER hardcode `userId = 'patrick'`** or any other constant. Always derive from Supabase Auth via `getUserId()`.
+- **NEVER add a new Supabase table without RLS policies.** Every tenant-owned table gets `enable row level security` plus a per-user policy. CI grep enforces this.
+- **NEVER list/get/update/delete a Mastra resource without `authorId` filtering** (or via the wrapper which does it for you).
+
+### Architecture
+- **Don't rebuild what Mastra provides** — use built-in memory, storage, observability, editor, workspace. No custom implementations.
+- **Don't reintroduce a separate API service.** Mastra is embedded in Next.js. There is no `apps/api` and no `@mastra/client-js` in the application path.
+- **Don't add new persistence layers.** All state is Supabase. No SQLite, no local files, no Redis-as-source-of-truth, no second database.
+- **Don't write code that requires the agent to dynamically load TypeScript at runtime.** Workflows and tools are code, in-repo. Skills, agents, prompts, and MCP connections are data. The line is hard.
+
+### Code quality
+- **Don't use `any` type.** Use `unknown` and narrow with type guards, or define proper types.
+- **Don't skip Zod schemas.** Every tool, workflow step, and API boundary needs schema validation.
+- **Don't hardcode model names.** Always use env vars with sensible defaults, or load from the stored agent config.
+- **Don't give agents unnecessary tools.** Scoped tool assignment. No tool bloat.
+- **Don't create role-based sub-agents** as a substitute for context firewalls. Use fresh contexts per task where appropriate.
+- **Don't write verbose agent instructions.** Concise, human-written instructions outperform long LLM-generated ones (ETH Zurich finding).
+- **Don't skip `workflow.commit()`.** Every workflow definition must call `.commit()` after the step chain.

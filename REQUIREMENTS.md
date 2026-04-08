@@ -1,14 +1,18 @@
 # MastraClaw — Requirements
 
+> **For architectural decisions, read [`ARCHITECTURE.md`](./ARCHITECTURE.md).** This document is the product-level specification: what the user can do, what the system delivers, in plain language. It does not prescribe how the system is built. Where implementation details appear here, they are illustrative and `ARCHITECTURE.md` overrides any conflict.
+
 ## Vision
 
 MastraClaw is an enterprise-ready personal AI agent for executives, founders, solopreneurs, and small business leaders. It replaces a human executive assistant — managing email, calendar, research, content, and enterprise data access — available 24/7 via voice, chat, and web interface.
 
-The product ships as a **minimal, curated base** with a secretary agent and core skills. Additional capabilities (social media management, CRM integration, custom workflows) are delivered as installable modules or custom consulting engagements.
+The product ships as a **minimal, curated base** with a Main Agent (the orchestrator) and core skills. Additional capabilities (social media management, CRM integration, custom workflows) are delivered as installable modules or custom consulting engagements.
+
+The technical foundation is a **single-process Next.js application** that embeds [Mastra](https://mastra.ai) directly. All persistent state lives in [Supabase](https://supabase.com) — Postgres for data, S3-compatible Storage for files, Auth for identity, Vault for secrets, and pgvector for embeddings. The compute layer is fully disposable; everything that matters is in Supabase. See `ARCHITECTURE.md` for the full rationale.
 
 ---
 
-## 0. Core Principle — Human-in-the-Loop
+## 0a. Core Principle — Human-in-the-Loop
 
 **No destructive action without explicit user approval.** This is the foundational reliability principle of MastraClaw.
 
@@ -22,6 +26,50 @@ The agent MUST request approval before:
 Approval can be granted via any connected channel (Telegram, Teams, Web UI). The agent presents a clear summary of what it intends to do and waits for explicit confirmation. Configurable per action type: some actions can be set to auto-approve after the user builds trust (e.g., "always auto-approve calendar event creation").
 
 Timeout handling: if no approval within a configurable window, the agent sends a reminder. After a second timeout, the task is parked and flagged in the review board.
+
+---
+
+## 0b. Core Principle — Multi-Tenancy as a Foundation
+
+**MastraClaw is a multi-tenant system that happens to ship Phase 1 with a single tenant.** This is not a future feature — it is a Phase 1 architectural foundation. The data model, the authorization layer, and every database query are written as if multiple users exist. There is no "single-user shortcut" anywhere in the codebase.
+
+What this means for the product:
+
+- Every Mastra resource (agent, prompt, skill, MCP connection, scorer, workspace) belongs to exactly one user (`authorId`). Phase 1 has only one user, but every row carries the foreign key.
+- Every database query is scoped by the authenticated `userId`. The application code uses a `scopedMastra(userId)` wrapper for all Mastra operations and never bypasses it. Bypassing is a CI failure.
+- Postgres Row-Level Security policies enforce tenant isolation at the database level — a second, independent layer below the application wrapper. Any bug in the wrapper still cannot leak data across users.
+- Workspaces, Vault secrets, conversation history, embeddings — everything is partitioned per user, even though only one user exists in Phase 1.
+
+What this means for the user experience in Phase 1:
+
+- The system ships with no public signup. The first authenticated login auto-provisions Patrick's user record. No second user can be added without code-level provisioning.
+- The UI does not display user names, organization choosers, or team UI. There is exactly one user; no chrome is needed for user switching.
+- All "single-user" features (settings, secrets, dashboard) work exactly as a single-user product would.
+
+What changes when user #2 arrives later:
+
+- A signup form is added.
+- Optional org/team grouping is added if needed.
+- **No data migration. No query rewrites. No security audit.** The foundation is already correct.
+
+The full implementation of this principle — `authorId` on every stored resource, the `scopedMastra` wrapper, RLS policies, and the server-only execution boundary that prevents secrets from ever reaching the browser — is described in `ARCHITECTURE.md` §4 and §2.
+
+---
+
+## 0c. Core Principle — Server-Only Execution Boundary
+
+**Mastra runs only on the server. Never in the browser. Never in any client bundle.**
+
+The Next.js application is split, by design, into two execution contexts:
+
+- **Server context** (Server Components, Route Handlers, Server Actions): can import `@/mastra`, holds the `mastra` instance, accesses Supabase Vault, sees LLM API keys. Untrusted user input enters here, but secrets never leave.
+- **Client context** (Client Components, browser-shipped code): never imports `@/mastra` or `@mastra/*`, never sees secrets, never holds API keys. Communicates with the server via Server Actions or Route Handler `fetch` calls.
+
+Why this matters: putting an LLM API key in a browser bundle does not just leak the key — it leaks billing. Anyone inspecting the JS source can extract the key and use it. For a Personal Agent that holds the user's most sensitive data, the same applies to memory access, integration tokens, and agent instructions. Server-only is not paranoia; it is the entry-level cost of building this kind of system responsibly.
+
+CI enforces this: any file with `'use client'` that imports from `@/mastra` or `@mastra/*` fails the build. No exceptions.
+
+See `ARCHITECTURE.md` §2 for full details.
 
 ---
 
@@ -84,8 +132,8 @@ The core deliverable. A personal agent that functions as an executive assistant.
 - Generate Word documents (DOCX) for reports and proposals
 - Templates configurable per user/company — delivered as customizable skills
 - Output delivered in chat, via email, or stored in document store
-- **File Storage**: All generated documents stored in **Convex File Storage** (primary), searchable and accessible via MCP
-- **Optional**: MinIO (S3-compatible) as alternative storage backend for on-premise deployments with large file volumes
+- **File Storage**: All generated documents stored in **Supabase Storage** (S3-compatible API) under the user's per-agent workspace prefix (`users/{userId}/agents/{agentId}/...`). Indexed in Postgres for search and discoverable via MCP.
+- **On-premise option**: Self-hosted Supabase or any S3-compatible store (MinIO, Cloudflare R2) — `@mastra/s3` works against all of them. No code change required.
 
 ### 1.9 YouTube Summarization
 - User shares a YouTube URL → agent extracts transcript → generates summary
@@ -125,18 +173,35 @@ The core deliverable. A personal agent that functions as an executive assistant.
 ## 3. Channels & Delivery
 
 ### 3.1 Supported Channels
-- **Telegram** — Primary mobile channel, voice messages, inline keyboards
-- **Microsoft Teams** — Enterprise standard, required for corporate adoption
-- **Slack** — Tech/startup teams
-- **Discord** — Community/internal teams
-- **Web UI** — Built-in chat interface (see section 5)
-- Additional channels via Vercel Chat SDK as needed
+- **Telegram** — Primary mobile channel, voice messages, inline keyboards. Phase 1.
+- **Web UI** — Built-in chat interface (see section 5). Phase 1.
+- **Microsoft Teams** — Enterprise standard. Phase 2.
+- **Slack** — Tech/startup teams. Phase 2.
+- **Discord** — Community/internal teams. Phase 3.
+- Additional channels added as code-defined adapters in `src/lib/channels/` (no third-party channel SDK in Phase 1).
 
-### 3.2 Channel Architecture
-- One main agent accessible from all channels
-- Cross-channel notifications: task started in web UI, notification delivered to Telegram
-- Channel-specific formatting (Telegram markdown vs. Teams adaptive cards)
-- User allowlist per channel for security
+### 3.2 Channel Architecture: Main Agent + Direct Sub-Agent Channels
+
+The Main Agent owns the **default** channel of every connected medium:
+- Default Telegram bot (one bot, owned by the Main Agent)
+- Default Web UI chat session
+- Default voice interface
+
+Beyond the defaults, **sub-agents can be exposed on their own channels**. The most common case is dedicated Telegram bots:
+
+- The user creates a new Telegram bot via BotFather (e.g. `@PatrickFinanceBot`).
+- They paste the bot token into MastraClaw's web UI.
+- The token is stored in Supabase Vault (per-user).
+- A `bindings` row maps `(channel='telegram', channel_account='@PatrickFinanceBot') → agent='finance-agent'`.
+- All messages to that bot bypass the Main Agent and reach the Finance sub-agent directly.
+
+The same model works for any channel: a user can have multiple Telegram bots, each routed to a different agent. They can have a "main" Web UI chat with the Main Agent and a "scoped" chat session with a specific sub-agent.
+
+Direct sub-agent communication is **complementary** to delegation through the Main Agent — both modes coexist. The user can write to `@PatrickFinanceBot` for direct finance work and to the Main Agent on the default bot for general work; the Main Agent in turn can delegate finance questions to the same Finance sub-agent under the hood.
+
+Routing is configured in the `bindings` table (see `ARCHITECTURE.md` §6 for the resolution algorithm and table schema). Adding a new direct sub-agent bot requires zero code changes — only a Vault entry, a `bindings` row, and a Telegram webhook registration. All of this is exposed in the web UI.
+
+Cross-channel notifications: a task started in the Web UI delivers its result via the user's primary mobile channel (Telegram by default). User allowlist per channel is enforced via the same auth/identity layer — only authenticated `userId`s with matching bindings receive responses.
 
 ### 3.3 Voice-First Mobile Experience
 - Optimized for on-the-go usage via Telegram/Teams voice messages
@@ -302,15 +367,23 @@ A separately installable module, not part of the base agent.
 - Follow-up reminders based on meeting outcomes
 
 ### 8.4 Technology Stack
-- Agent Framework: Mastra.ai
-- Database: Convex.dev (reactive, vector search, full-text search, durable functions)
-- Web UI: Next.js + shadcn/ui + Tailwind CSS
-- Channels: Vercel Chat SDK
-- Model Routing: Vercel AI SDK + AI Gateway
-- Durable Execution: Inngest / Workflow SDK
-- Observability: Langfuse / Langsmith / OpenTelemetry
-- Voice: ElevenLabs (TTS) + Whisper/Sherpa ONNX (STT)
-- Validation: Zod
+
+See `ARCHITECTURE.md` §3 for the detailed rationale. Summary:
+
+- **Agent Framework**: Mastra.ai (`@mastra/core`, `@mastra/editor`, `@mastra/memory`, `@mastra/observability`, `@mastra/pg`, `@mastra/s3`)
+- **Application**: Next.js 16 (App Router) — single process, Mastra embedded via direct import
+- **Database**: Supabase Postgres (via `@mastra/pg`), with pgvector for embeddings
+- **Auth**: Supabase Auth + `@supabase/ssr`
+- **File Storage**: Supabase Storage (S3 API) via `@mastra/s3`, used as the workspace filesystem for every agent
+- **Secrets**: Supabase Vault (`pgsodium`) for per-user user-level secrets; host env vars for the ~5 bootstrap secrets
+- **Channels**: Custom adapters in `src/lib/channels/`, routed via the `bindings` table in Postgres
+- **Model Routing**: Mastra's built-in model router (`provider/model-name` strings)
+- **Durable Execution**: Mastra workflows (in code, in-repo); Inngest or Trigger.dev evaluated for Phase 2 only if needed
+- **Observability**: `@mastra/observability` with `DefaultExporter` + `SensitiveDataFilter`; optional Langfuse / OpenTelemetry exporters
+- **Voice**: ElevenLabs (TTS) + STT TBD (Whisper API or Sherpa ONNX)
+- **Validation**: Zod
+
+**Explicitly not used:** Convex, LibSQL (production), Vercel Chat SDK, Doppler, Composio (Phase 1), separate API service.
 
 ---
 
@@ -399,6 +472,58 @@ How the system stays current and how capabilities are added.
 
 ---
 
+## 13. Backup & Restore
+
+A Personal Agent that holds the user's most sensitive data must be backable, restorable, and survivable. This is a Tier 1 requirement, not a "we will figure it out later" item.
+
+### 13.1 Promise to the user
+
+- "Your agent's brain — every conversation, every memory, every skill, every secret you entered, every connected MCP server, every preference — is in **one place** and can be backed up with **one command**."
+- "If the server you are running on disappears tomorrow, you can spin up a new one and have everything back in under 15 minutes. The compute layer holds nothing — it is throwaway."
+- "Your secrets in the backup are encrypted. You can store the backup file in any cloud bucket, on any external disk, or send it to yourself via email — the encryption key never leaves Supabase, so the file alone cannot be read by anyone."
+
+### 13.2 What is in the backup set
+
+| Data | Backed up by |
+|---|---|
+| Agents (user-created), prompts, skills metadata, MCP connections, scorers, versions | `pg_dump` of Supabase Postgres |
+| Conversations, memory threads, working memory, observational memory, embeddings | same `pg_dump` |
+| User-provided secrets (LLM API keys, channel bot tokens, MCP auth) | same `pg_dump` — stored as Vault ciphertexts, never plaintext |
+| Bindings (channel → agent routing), user settings, app tables | same `pg_dump` |
+| Workspace files — skill Markdown content, generated PDFs, audio clips, attachments | `aws s3 sync` against the Supabase Storage bucket |
+| Bootstrap secrets (~5 values: DB URL, Supabase service role, S3 credentials) | Manual: 1Password / Bitwarden / age-encrypted file — these live in the host's env vars, not in Supabase |
+
+The compute layer (Vercel/Railway container) holds **no persistent state**. There is no second database, no local SQLite cache, no on-disk file cache. Anything you write that you want to survive a redeploy goes through the same persistence layers above.
+
+### 13.3 Backup mechanism (Tier 1)
+
+- A daily scheduled job runs `pg_dump` + `aws s3 sync` and pushes both to an off-site target chosen by the user (Backblaze B2, Hetzner Storage Box, encrypted external disk, etc.).
+- Phase 1 ships with a default backup target choice and a runbook. Phase 2 adds a web UI for choosing the destination and viewing backup history.
+- Supabase Pro additionally takes managed daily snapshots automatically. The user does not have to choose between the two — both run independently.
+- A manual "back up now" button is available in the web UI for ad-hoc backups before risky changes (e.g., installing a new MCP server).
+
+### 13.4 Restore mechanism (Tier 1)
+
+- The restore procedure is documented in `docs/runbook-restore.md` and is reproducible step-by-step.
+- The procedure: provision a fresh Supabase project, `psql` the dump, `aws s3 sync` the storage backup, update Layer A env vars on the host, redeploy from Git. End-to-end target: under 15 minutes.
+- A `restore` CLI command (Phase 2) wraps the steps for one-shot recovery.
+- The web UI surfaces no destructive "wipe and restore" button in Phase 1 — the procedure is intentionally manual to prevent accidents. Phase 3 may add it behind a typed-confirmation gate.
+
+### 13.5 Integrity (Tier 1)
+
+- A quarterly **restore drill** is part of the operations runbook: provision a throwaway Supabase project, restore last week's backup, boot a parallel preview deploy, log in, send a test message, verify the response, tear it all down. Documented checklist.
+- "Untested backups are wishes." If a drill fails, the backup procedure has a bug — and it is better to discover this on a quiet Tuesday than during an actual recovery.
+
+### 13.6 What backup explicitly does **not** cover
+
+- **Live external state** — if the user has connected to Notion via an MCP server, their Notion data is owned by Notion, not by MastraClaw. The connection (auth token, server URL) is in the backup; the data behind it is not.
+- **In-flight requests** — a backup is a point-in-time snapshot. Conversations that were mid-execution at backup time may need to be restarted after a restore.
+- **Layer A bootstrap secrets** — these live in the host's env vars, not in Supabase. They must be managed and backed up separately. They are small, stable, and rarely change, so this is a one-time copy into a password manager.
+
+Full architectural rationale, exact RLS / Vault / Storage policies, and restoration code samples: [`ARCHITECTURE.md`](./ARCHITECTURE.md) §12.
+
+---
+
 ## Competitive Analysis
 
 ### vs. OpenClaw
@@ -444,7 +569,12 @@ Paperclip is an orchestration layer for managing external agents as employees. M
 ## Priority Tiers
 
 ### Tier 1 — MVP (Base Personal Agent)
+- **Multi-tenancy foundation** (Section 0b — `authorId`, `scopedMastra`, RLS, server-only boundary — even though only one user exists)
+- **Server-only execution boundary** (Section 0c — CI-enforced, no Mastra in client bundles)
 - **Human-in-the-Loop** (approval gates for all destructive actions)
+- **Main Agent** (code-defined orchestrator) + ability to bind sub-agents to dedicated Telegram bots (Section 3.2)
+- Supabase backend (Postgres + pgvector + Storage + Auth + Vault) per `ARCHITECTURE.md`
+- Setup wizard (web-based) for user-level secrets (LLM keys, Telegram bot tokens) into Supabase Vault
 - Email management (read, write, organize)
 - Calendar management
 - Daily morning brief (default skill, user-customizable)
@@ -452,12 +582,12 @@ Paperclip is an orchestration layer for managing external agents as employees. M
 - Voice I/O (Telegram + Web)
 - Memory & personalization (setup interview)
 - Multi-language (German + English from day one)
-- Telegram channel integration
+- Telegram channel integration (default bot → Main Agent + per-sub-agent bots via bindings)
 - Web UI (chat + basic settings + onboarding wizard)
-- Document generation (PDF) + Convex File Storage
+- Document generation (PDF) + Supabase Storage
 - YouTube summarization
 - Basic company/person research
-- Module system (install/update mechanism)
+- Backup procedure (`pg_dump` + storage sync to off-site)
 
 ### Tier 2 — Enterprise Ready
 - Microsoft Teams integration
@@ -480,7 +610,8 @@ Paperclip is an orchestration layer for managing external agents as employees. M
 ### Tier 4 — Future
 - Memory consolidation ("Dreaming" / reflection workflows)
 - Skill marketplace / module registry
-- Multi-tenant / multi-company
+- **Public signup + multi-user UX** (the multi-tenant *foundation* is already in Tier 1; this is when we actually enable user #2 and beyond, adding signup forms, org/team grouping, optional billing/quotas)
 - Additional channels (Signal, WhatsApp, iMessage)
 - Event-based triggers / webhooks
 - Offline queue mode
+- JSON workflow DSL (if dynamic user-defined workflows become a real need)

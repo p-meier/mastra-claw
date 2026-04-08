@@ -365,9 +365,90 @@ Pre-configured for [Railway](https://railway.app) deployment with dual services 
 
 Every component is self-hostable:
 - **Mastra.ai** — MIT license, runs anywhere Node.js runs
-- **Convex** — FSL Apache 2.0, self-hosting available
+- **Supabase** — Apache 2.0, official Docker / Helm / bare-metal self-hosting
 - **Next.js** — MIT license, standard Node.js deployment
 - **ElevenLabs** — API-based, replaceable with any TTS/STT provider
+
+## Backup & Restore
+
+A Personal Agent that holds your most sensitive data needs a backup story you actually trust. MastraClaw is built around a **disposable compute layer**: the Vercel/Railway container holds zero persistent state, so backups are not snapshots of running servers — they are dumps of Supabase. Killing and recreating the entire compute stack is a no-op. Restore means provisioning a fresh Supabase project, loading the dump, pointing the same Git deploy at it, and continuing where you left off.
+
+### What is in the backup set
+
+| Data | Location | Backed up by |
+|---|---|---|
+| Mastra state — agents, prompts, skills, MCP connections, scorers, memory, sessions | Supabase Postgres (`@mastra/pg`) | `pg_dump` / Supabase managed backups |
+| Bindings, user settings, app tables | Supabase Postgres | same `pg_dump` |
+| Embeddings (RAG, semantic recall) | Supabase Postgres (pgvector) | same `pg_dump` |
+| User secrets (LLM keys, channel tokens, MCP auth) | Supabase Vault | same `pg_dump` — **only ciphertexts**, encryption keys never touch the dump |
+| Workspace files — skill content, generated PDFs, audio, attachments | Supabase Storage bucket (S3 API, `@mastra/s3`) | `aws s3 sync` / `rclone` against the Supabase Storage S3 endpoint |
+| Bootstrap secrets — DB URL, S3 keys, service role token | Vercel/Railway env vars | Manual: 1Password / Bitwarden / age-encrypted file |
+
+The compute container holds **nothing**. There is no local file to back up, no Redis cache to dump, no second database to coordinate.
+
+### Backup procedure
+
+A daily scheduled job (Vercel Cron, Railway scheduled task, or a cron on the host) runs:
+
+```bash
+# 1. Postgres dump (everything: Mastra state, app tables, Vault ciphertexts, embeddings)
+pg_dump --no-owner --no-acl "$DATABASE_URL" \
+  | gzip \
+  > "backup-$(date +%F).sql.gz"
+
+# 2. Storage bucket sync (workspaces, skills, generated artifacts)
+aws s3 sync \
+  "s3://workspaces" \
+  "./backup-storage-$(date +%F)/" \
+  --endpoint-url "https://${SUPABASE_PROJECT_REF}.supabase.co/storage/v1/s3"
+
+# 3. Push both to off-site
+rclone copy ./backup-* "$OFFSITE_REMOTE:mastra-claw-backups/"
+```
+
+The off-site target is your choice: Backblaze B2, Hetzner Storage Box, an encrypted external disk at home, an iCloud-mounted folder, anything `rclone` supports. Supabase Pro additionally takes daily managed snapshots automatically.
+
+### Restore procedure
+
+```bash
+# 1. Provision a fresh Supabase project (or self-host instance)
+#    Capture the new DATABASE_URL, SUPABASE_PROJECT_REF, S3 keys.
+
+# 2. Restore Postgres
+gunzip -c backup-2026-04-08.sql.gz | psql "$NEW_DATABASE_URL"
+
+# 3. Restore Storage
+aws s3 sync \
+  ./backup-storage-2026-04-08/ \
+  "s3://workspaces" \
+  --endpoint-url "https://${NEW_PROJECT_REF}.supabase.co/storage/v1/s3"
+
+# 4. Update Layer A env vars on the host with the new project credentials
+# 5. Redeploy the Next.js application
+```
+
+That is the entire restore procedure. The compute layer comes back from a redeploy of the Git repository — there is nothing else to restore.
+
+### Why this works
+
+- **Postgres is forever.** Even if Supabase disappears, `pg_dump` produces standard SQL that imports into any other Postgres in seconds. No proprietary export format, no vendor escape clause.
+- **Vault ciphertexts in the same dump.** Supabase Vault stores user secrets (LLM keys, bot tokens, MCP auth) as `pgsodium`-encrypted columns inside Postgres. The encryption key lives in Supabase's key-management layer, not in the database itself. So `pg_dump` automatically captures every secret in encrypted form — your backup file is safe to store anywhere, even unencrypted cloud buckets, because the ciphertexts cannot be read without the decryption key.
+- **No `MASTER_KEY` to lose.** There is no application-level master key to manage separately. Vault handles key management; the application only ever sees decrypted values transiently in memory at request time.
+- **Server is disposable.** The Vercel/Railway container is a build artifact of the Git repository. It can be destroyed and rebuilt at any time without losing data. This means a recovery drill is: provision Supabase, restore dump, redeploy from Git. Three steps, ~10 minutes.
+
+### Backup integrity tests
+
+Untested backups are wishes. MastraClaw includes a quarterly drill in the operations runbook:
+
+1. Spin up a throwaway Supabase project.
+2. Restore the latest backup into it.
+3. Boot a Vercel preview deploy that points at the throwaway project.
+4. Verify you can log in, see your data, send a test message to the Main Agent, and receive a reply.
+5. Tear down the throwaway resources.
+
+If any step fails, the backup procedure has a bug — and it is better to find out during a drill than during an actual recovery.
+
+Full architectural rationale and the exact RLS, Vault, and Storage policies are in [`ARCHITECTURE.md`](./ARCHITECTURE.md) §12.
 
 ## Status
 
