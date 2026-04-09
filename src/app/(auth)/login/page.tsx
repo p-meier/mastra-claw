@@ -27,28 +27,27 @@ export default async function LoginPage({
   if (user) redirect(params.next ?? '/');
 
   return (
-    // The login screen is its own visual world: deep dark canvas, atmospheric
-    // gradient blooms in violet+cyan (sampled directly from the logo), a
-    // faint hexagonal lattice as a nod to the logo's geometry, and a
-    // glassmorphic card carrying the form. Everything else in the app is
-    // light — this page is the threshold you cross to enter it.
+    // The login screen is its own visual world: deep dark canvas, a single
+    // atmospheric warm-amber bloom, a faint hexagonal lattice as a nod to
+    // the logo's geometry, and a glassmorphic card carrying the form.
+    // Single accent color — playfulness lives in the mascot, not here.
     <div className="relative isolate flex min-h-svh items-center justify-center overflow-hidden bg-[#08080b] px-6 py-12 text-white">
-      {/* Atmospheric layer 1: violet bloom from upper-left */}
+      {/* Single warm-amber bloom from the upper-left */}
       <div
         aria-hidden
         className="pointer-events-none absolute -top-40 -left-40 size-[700px] rounded-full opacity-[0.18] blur-3xl"
         style={{
           background:
-            'radial-gradient(closest-side, #7c3aed 0%, transparent 70%)',
+            'radial-gradient(closest-side, #f59e0b 0%, transparent 70%)',
         }}
       />
-      {/* Atmospheric layer 2: cyan bloom from lower-right */}
+      {/* A second, fainter ember from the lower-right for depth */}
       <div
         aria-hidden
-        className="pointer-events-none absolute -right-40 -bottom-40 size-[700px] rounded-full opacity-[0.16] blur-3xl"
+        className="pointer-events-none absolute -right-40 -bottom-40 size-[700px] rounded-full opacity-[0.10] blur-3xl"
         style={{
           background:
-            'radial-gradient(closest-side, #06b6d4 0%, transparent 70%)',
+            'radial-gradient(closest-side, #b45309 0%, transparent 70%)',
         }}
       />
 
@@ -107,7 +106,7 @@ export default async function LoginPage({
           {/* Gradient hairline along the top edge — signature accent */}
           <div
             aria-hidden
-            className="absolute inset-x-8 -top-px h-px bg-gradient-to-r from-transparent via-violet-400/60 to-transparent"
+            className="absolute inset-x-8 -top-px h-px bg-gradient-to-r from-transparent via-amber-400/60 to-transparent"
           />
 
           <div className="relative overflow-hidden rounded-2xl border border-white/[0.07] bg-white/[0.025] px-8 py-10 shadow-[0_30px_80px_-20px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
@@ -117,7 +116,7 @@ export default async function LoginPage({
                 className="animate-in fade-in slide-in-from-bottom-2 duration-700"
                 style={{
                   filter:
-                    'drop-shadow(0 0 28px rgba(167, 139, 250, 0.35)) drop-shadow(0 0 14px rgba(34, 211, 238, 0.18))',
+                    'drop-shadow(0 0 28px rgba(251, 191, 36, 0.40)) drop-shadow(0 0 14px rgba(245, 158, 11, 0.22))',
                 }}
               >
                 <Image
@@ -181,7 +180,7 @@ export default async function LoginPage({
                   autoComplete="email"
                   required
                   placeholder="you@example.com"
-                  className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 placeholder:text-white/25 outline-none transition-all focus:border-violet-400/40 focus:bg-white/[0.06] focus:ring-4 focus:ring-violet-400/10"
+                  className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 placeholder:text-white/25 outline-none transition-all focus:border-amber-400/50 focus:bg-white/[0.06] focus:ring-4 focus:ring-amber-400/15"
                 />
               </div>
 
@@ -204,7 +203,7 @@ export default async function LoginPage({
                   type="password"
                   autoComplete="current-password"
                   required
-                  className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 outline-none transition-all focus:border-violet-400/40 focus:bg-white/[0.06] focus:ring-4 focus:ring-violet-400/10"
+                  className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 outline-none transition-all focus:border-amber-400/50 focus:bg-white/[0.06] focus:ring-4 focus:ring-amber-400/15"
                 />
               </div>
 
@@ -220,7 +219,7 @@ export default async function LoginPage({
 
               <button
                 type="submit"
-                className="group animate-in fade-in slide-in-from-bottom-1 relative mt-1 inline-flex h-11 items-center justify-center overflow-hidden rounded-lg bg-gradient-to-r from-violet-500 via-violet-400 to-cyan-400 text-sm font-medium text-black shadow-[0_8px_32px_-8px_rgba(124,58,237,0.6)] transition-all duration-300 hover:shadow-[0_12px_40px_-8px_rgba(124,58,237,0.7)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 focus-visible:ring-offset-2 focus-visible:ring-offset-[#08080b] active:scale-[0.99]"
+                className="group animate-in fade-in slide-in-from-bottom-1 relative mt-1 inline-flex h-11 items-center justify-center overflow-hidden rounded-lg bg-amber-500 text-sm font-semibold text-black shadow-[0_8px_32px_-8px_rgba(245,158,11,0.55)] transition-all duration-200 hover:bg-amber-400 hover:shadow-[0_12px_40px_-8px_rgba(245,158,11,0.7)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#08080b] active:scale-[0.99]"
                 style={{
                   animationDelay: '420ms',
                   animationFillMode: 'both',

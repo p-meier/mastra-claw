@@ -9,6 +9,7 @@ import {
 } from '@mastra/observability';
 
 import { env } from '@/lib/env';
+import { personalAssistant } from './agents/personal-assistant';
 import { storage } from './storage';
 
 /**
@@ -35,7 +36,7 @@ const auth = new MastraAuthSupabase({
 });
 
 export const mastra = new Mastra({
-  agents: {},
+  agents: { personalAssistant },
   workflows: {},
   scorers: {},
   editor: new MastraEditor(),

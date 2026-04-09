@@ -44,6 +44,12 @@ const schema = z.object({
   // === Optional model defaults (override via stored agent config) ===
   MAIN_AGENT_MODEL: z.string().optional(),
   SPECIALIST_MODEL: z.string().optional(),
+
+  // === ElevenLabs voice defaults ===
+  // Hard-coded per deployment, can be overridden via app_settings later
+  // (admin-only). The API key itself lives in Vault, never here.
+  ELEVENLABS_VOICE_ID: z.string().min(1),
+  ELEVENLABS_MODEL_ID: z.string().min(1),
 });
 
 const parsed = schema.safeParse(process.env);

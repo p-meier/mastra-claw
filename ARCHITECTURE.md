@@ -858,101 +858,79 @@ If, in the future, dynamic workflow definitions become necessary, the right appr
 
 ---
 
-## 11. Secrets — Two Layers
+## 11. Secrets — Three Layers
 
-### 11.1 The two layers
+> **Revision note (2026-04-08).** Earlier drafts described Layer B as "per-user secrets". After reviewing the deployment model — one IT admin per company configures the instance, then N end users do their personal onboarding — the right model is **app-managed by default, per-user override optional**. This section reflects that. Codepath: `supabase/migrations/20260408195437_onboarding.sql` and `src/mastra/lib/secret-service.ts`.
+
+### 11.1 The three layers
 
 | Layer | Where it lives | Who manages it | What it holds | Loaded at |
 |---|---|---|---|---|
-| **Layer A — Bootstrap** | env vars on Vercel/Railway | Patrick (manually, ~5 values) | `DATABASE_URL`, `SUPABASE_PROJECT_REF`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_S3_ACCESS_KEY_ID`, `SUPABASE_S3_SECRET_ACCESS_KEY` | server boot time |
-| **Layer B — User Secrets** | Supabase Vault | The user, via the web UI wizard | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, MCP auth tokens, integration tokens | lazily, per agent invocation |
+| **Layer A — Bootstrap** | env vars on Vercel/Railway | The IT admin (manually, ~5 values) | `DATABASE_URL`, Supabase URL/keys, S3 credentials, ElevenLabs voice/model defaults | server boot time |
+| **Layer B — App secrets** | Supabase Vault, namespace `app:<name>` | The IT admin via the Admin Setup wizard | `app:llm_api_key`, `app:image_video_api_key`, `app:elevenlabs_api_key`, `app:telegram_bot_token`, `app:composio_api_key` | lazily, per request |
+| **Layer C — User overrides** | Supabase Vault, namespace `user:<userId>:<name>` | Each user from settings (no UI in Phase 1) | optional per-user replacements for any Layer B secret | lazily, per request |
 
-This separation is deliberate: Layer A is what the system needs to start; Layer B is what features need to actually do work. Layer A is small, stable, sensitive at the infrastructure level. Layer B is dynamic, growing, sensitive at the user level.
+**Lookup precedence at runtime:** `user:<userId>:<name>` (if set) → `app:<name>` (default) → `null`.
 
-### 11.2 Layer B in detail: Supabase Vault
+This split matches the deployment model:
 
-Supabase Vault stores secrets in a special Postgres table (`vault.secrets`) with column-level encryption via `pgsodium`. The encryption key never lives in the database itself — it is managed by Supabase's backend (or by `pgsodium` key management on self-hosted Supabase). Backups (`pg_dump`) contain only ciphertexts.
+- The **Layer A** values are infrastructure (database, storage, voice ID defaults). The IT admin sets them once on the host.
+- **Layer B** values are *the company's keys*. One Anthropic API key, one ElevenLabs key, one Telegram bot token, one Composio project — paid by the company, managed by the admin, used by every end user. This is what the Admin Setup wizard writes during first-run.
+- **Layer C** is the escape hatch for the rare case where a user genuinely needs their own credentials (e.g. a contractor with their own GitHub OAuth). The `SecretService.userSecrets()` surface exists from day 1 so adding a settings UI later is purely additive.
 
-```sql
--- Writing a secret (called from a Server Action)
-select vault.create_secret(
-  'sk-proj-AbCdEf...',
-  '{userId}:openai_api_key',
-  'OpenAI API key for default user'
-);
+### 11.2 Layer B/C in detail: Supabase Vault
 
--- Reading a secret
-select decrypted_secret
-from vault.decrypted_secrets
-where name = '{userId}:openai_api_key';
-```
+Vault stores secrets in `vault.secrets` with column-level encryption via `pgsodium`. The encryption key is managed by Supabase's backend (or by `pgsodium` key management on self-hosted Supabase) and never lives in the database itself. `pg_dump` backups contain only ciphertexts.
 
-The naming convention `{userId}:{secret_name}` ensures per-user isolation. Combined with RLS policies on `vault.decrypted_secrets`, a user can only read their own secrets.
+All access goes through SECURITY DEFINER functions defined in `supabase/migrations/20260408195437_onboarding.sql`:
+
+| Function | Namespace | Authorization |
+|---|---|---|
+| `app_secret_set(p_name, p_value)` | `app:<name>` | requires `app_metadata.role = 'admin'` |
+| `app_secret_get(p_name)` | `app:<name>` | requires `app_metadata.role = 'admin'` |
+| `app_secret_delete(p_name)` | `app:<name>` | requires `app_metadata.role = 'admin'` |
+| `app_secret_list()` | `app:%` | requires `app_metadata.role = 'admin'` |
+| `user_secret_set(p_name, p_value)` | `user:auth.uid():<name>` | requires authenticated session |
+| `user_secret_get(p_name)` | `user:auth.uid():<name>` | requires authenticated session |
+| `user_secret_delete(p_name)` | `user:auth.uid():<name>` | requires authenticated session |
+
+The functions live in the `public` schema (so the Supabase JS client can call them via plain `.rpc(...)` without custom schema config), but `EXECUTE` is `REVOKE`d from `PUBLIC` and `GRANT`ed only to `authenticated`. The internal role/uid checks provide a second authorization layer. Callers never construct the full Vault name — the namespace prefix is appended inside the function — so a user cannot escape their namespace by passing a colon-laden name.
 
 ### 11.3 The `SecretService` abstraction
 
-Application code never reads from Vault directly. It goes through `src/mastra/lib/secret-service.ts`:
+Application code never touches Vault or the RPC functions directly. It goes through `src/mastra/lib/secret-service.ts`:
 
 ```ts
-import { sql } from '@/lib/db';
+// Two surfaces, both server-only:
+import { appSecrets, userSecrets, APP_SECRET_NAMES } from '@/mastra/lib/secret-service';
 
-export class SecretService {
-  private cache = new Map<string, { value: string; expires: number }>();
+// Layer B — admin only, throws at the database boundary if not admin
+await appSecrets.set(APP_SECRET_NAMES.llmApiKey, 'sk-ant-...');
+const key = await appSecrets.get(APP_SECRET_NAMES.llmApiKey);
+const names = await appSecrets.list();
 
-  constructor(private userId: string) {
-    if (!userId) throw new Error('SecretService requires a userId');
-  }
-
-  async get(name: string): Promise<string> {
-    const key = `${this.userId}:${name}`;
-    const cached = this.cache.get(key);
-    if (cached && cached.expires > Date.now()) return cached.value;
-
-    const rows = await sql`
-      select decrypted_secret
-      from vault.decrypted_secrets
-      where name = ${key}
-      limit 1
-    `;
-    if (!rows[0]) throw new Error(`Secret ${name} not found for user ${this.userId}`);
-
-    const value = rows[0].decrypted_secret;
-    this.cache.set(key, { value, expires: Date.now() + 5 * 60_000 }); // 5min in-memory cache
-    return value;
-  }
-
-  async set(name: string, value: string): Promise<void> {
-    const key = `${this.userId}:${name}`;
-    await sql`select vault.create_secret(${value}, ${key}, '')`;
-    this.cache.delete(key);
-  }
-
-  async list(): Promise<{ name: string; description: string }[]> {
-    const rows = await sql`
-      select name, description
-      from vault.secrets
-      where name like ${`${this.userId}:%`}
-    `;
-    return rows.map(r => ({
-      name: r.name.slice(this.userId.length + 1),
-      description: r.description,
-    }));
-  }
-}
+// Layer C — scoped to auth.uid() automatically
+await userSecrets.set('github_oauth_token', '...');
+const token = await userSecrets.get('github_oauth_token');
 ```
 
-This service is constructed per request, scoped to the authenticated user. It is the **only** interface to user secrets in the application.
+Reads are wrapped in `react.cache` so duplicate lookups in the same request only hit the database once.
 
-### 11.4 The setup wizard
+### 11.4 The Admin Setup wizard
 
-The web UI has a setup wizard accessible from the user menu. It is a step-by-step form that captures required secrets:
+The web UI has an admin-gated wizard at `/admin/setup` that runs once per deployment. Each step:
 
-1. "Choose your LLM provider" → enter OpenAI / Anthropic / Google key → stored via `secretService.set('openai_api_key', ...)`
-2. "Connect Telegram" → enter bot token → stored as `telegram_main_bot_token`
-3. "Add MCP server" → URL + auth → stored as `mcp_<name>_token`
-4. ...
+1. Pick LLM provider (Anthropic / OpenAI / OpenRouter / **Vercel AI Gateway, recommended** / Custom OpenAI-compatible)
+2. Enter the API key — server-side test against `/v1/models` blocks Continue until green
+3. Pick a default model from the probe response
+4. (Optional, auto-skipped if step 1 = Vercel AI Gateway) Image/video provider
+5. (Optional) ElevenLabs API key — voice ID + model ID come from `.env` defaults
+6. (Optional) Telegram bot token — server-side test against `getMe`
+7. (Optional) Composio API key — one project per company, per-user OAuth via Connect Links happens later on demand
 
-No secret is ever shown to the client after being entered. The form posts to a Server Action that stores the value in Vault and returns success/failure only.
+After step 7 the wizard shows a handoff screen with two large buttons: "Continue with my personal setup" → `/onboarding`, or "Skip — I'm just the administrator" → `/`. The skip path is for the IT-admin-only deployment model where the admin never uses the assistant themselves.
+
+No secret is ever shown to the client after being entered. Each step's Server Action calls a probe (in `src/lib/setup/probes.ts`), and only writes to Vault + `app_settings` if the probe returns `{ ok: true }`.
 
 ### 11.5 Why no `MASTER_KEY`
 
