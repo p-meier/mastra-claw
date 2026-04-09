@@ -36,7 +36,11 @@ create trigger app_settings_touch_updated_at
   before update on public.app_settings
   for each row execute function public.app_settings_touch_updated_at();
 
--- Marker so the app knows whether the setup wizard has been completed.
-insert into public.app_settings (key, value)
-values ('wizard.completed', 'false'::jsonb)
-on conflict (key) do nothing;
+-- The original draft of this migration seeded a `wizard.completed`
+-- boolean here. That key was superseded by `app.setup_completed_at`
+-- (a real timestamp written by the admin setup wizard) and the
+-- resolver no longer recognises it — keeping the seed produces a
+-- harmless but noisy `[settings] ignoring unknown app_settings key`
+-- warning on every page render. The seed was removed entirely
+-- because the table starts empty and the wizard writes whatever
+-- it needs from scratch.
