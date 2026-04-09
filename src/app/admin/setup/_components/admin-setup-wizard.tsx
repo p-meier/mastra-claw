@@ -164,11 +164,30 @@ export function AdminSetupWizard() {
         setError(res.error);
         return;
       }
-      // Pre-select a sensible default model from the returned list
-      const defaultGuess =
-        res.models.find((m) => /sonnet|gpt-4o|gpt-5|claude-3-5/i.test(m)) ??
-        res.models[0] ??
-        '';
+      // Pre-select a sensible default model from the returned list.
+      // Priority order: prefer the latest Claude Sonnet (4.6), then any
+      // Sonnet 4.x, then GPT-5 / GPT-4o, then anything that mentions
+      // "sonnet". The original regex picked "the first model containing
+      // 'sonnet'" which on the Vercel gateway sorts alphabetically and
+      // landed on the older claude-3.7-sonnet.
+      const PREFERENCE_PATTERNS: RegExp[] = [
+        /claude-sonnet-4[._-]?6/i,
+        /claude-sonnet-4[._-]?5/i,
+        /claude-sonnet-4/i,
+        /claude-.*sonnet-4/i,
+        /gpt-5/i,
+        /gpt-4o/i,
+        /sonnet/i,
+      ];
+      let defaultGuess = '';
+      for (const re of PREFERENCE_PATTERNS) {
+        const match = res.models.find((m) => re.test(m));
+        if (match) {
+          defaultGuess = match;
+          break;
+        }
+      }
+      if (!defaultGuess) defaultGuess = res.models[0] ?? '';
       update({ llmModels: res.models, defaultTextModel: defaultGuess });
       advance(false);
     });
@@ -426,7 +445,7 @@ export function AdminSetupWizard() {
                 draft.provider === 'anthropic'
                   ? 'sk-ant-…'
                   : draft.provider === 'vercel-gateway'
-                    ? 'gw_…'
+                    ? 'vck_…'
                     : 'sk-…'
               }
               helpHref={PROVIDER_KEY_HELP[draft.provider]}
@@ -523,7 +542,7 @@ export function AdminSetupWizard() {
           <div className="flex flex-col gap-5">
             <KeyInput
               label="Vercel AI Gateway API Key"
-              placeholder="gw_…"
+              placeholder="vck_…"
               helpHref="https://vercel.com/dashboard/ai-gateway"
               value={draft.imageVideoKey ?? ''}
               onChange={(v) => update({ imageVideoKey: v || null })}
@@ -667,7 +686,7 @@ export function AdminSetupWizard() {
           <div className="flex flex-col gap-5">
             <KeyInput
               label="Composio API key"
-              placeholder="ck_…"
+              placeholder="ak_…"
               helpHref="https://platform.composio.dev/settings"
               value={draft.composioKey ?? ''}
               onChange={(v) => update({ composioKey: v || null })}

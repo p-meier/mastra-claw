@@ -44,7 +44,7 @@ export default async function AccountSettingsPage() {
       </header>
 
       <div className="flex flex-1 flex-col gap-6 p-4 sm:p-6">
-        <Card className="max-w-3xl">
+        <Card>
           <CardHeader>
             <CardTitle>Personal preferences</CardTitle>
             <CardDescription>
@@ -61,7 +61,7 @@ export default async function AccountSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="max-w-3xl">
+        <Card>
           <CardHeader>
             <CardTitle>Account</CardTitle>
             <CardDescription>

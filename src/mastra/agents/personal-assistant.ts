@@ -100,7 +100,7 @@ export const personalAssistant = new Agent({
   // still callable from Studio for development.
   model: ({ requestContext }) => {
     const m = requestContext?.get('model') as string | undefined;
-    return m ?? 'anthropic/claude-sonnet-4-5';
+    return m ?? 'anthropic/claude-sonnet-4-6';
   },
 
   requestContextSchema: personalAssistantContextSchema.extend({
