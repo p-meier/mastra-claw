@@ -1,5 +1,11 @@
 import 'server-only';
 
+import { createGateway } from '@ai-sdk/gateway';
+import { getProviderConfig } from '@mastra/core/llm';
+
+import type { LlmProvider } from '@/lib/settings/resolve';
+export type { LlmProvider } from '@/lib/settings/resolve';
+
 /**
  * Test-connection probes used by the Admin Setup wizard. Every credential
  * step in the wizard runs the matching probe via a Server Action; the
@@ -19,6 +25,27 @@ import 'server-only';
  *  - On the LLM probe, we return the list of available models so the next
  *    wizard step (model picker) can populate its select without a second
  *    round-trip.
+ *
+ * Where the URLs and model lists come from
+ * ----------------------------------------
+ * We deliberately avoid scattering provider base URLs and response-shape
+ * parsers across this file. Instead:
+ *
+ *  1. **Vercel AI Gateway** uses `createGateway({ apiKey }).getAvailableModels()`
+ *     from `@ai-sdk/gateway`. The SDK owns the URL and the response shape.
+ *  2. **OpenRouter** pulls its base URL from Mastra's `PROVIDER_REGISTRY`
+ *     via `getProviderConfig('openrouter')`. The model list also comes
+ *     from there.
+ *  3. **Anthropic / OpenAI** are the only providers whose endpoint is
+ *     hardcoded in this file (see `PROBE_ENDPOINTS`). Neither
+ *     `@ai-sdk/anthropic` nor `@ai-sdk/openai` exposes its default base
+ *     URL as a constant or runtime property, and Mastra's registry does
+ *     not record one for them either — these two endpoints have no
+ *     authoritative external source we could derive them from. The model
+ *     list still comes from Mastra's registry.
+ *  4. **Custom OpenAI-compatible endpoints** (LMStudio, vLLM, private
+ *     deployments) hit the user-supplied base URL and parse the response
+ *     because Mastra has no entry for private servers.
  */
 
 export type ProbeResult<T extends object = object> =
@@ -55,22 +82,46 @@ function safeError(prefix: string, err: unknown): { ok: false; error: string } {
 // LLM probe (text providers)
 // ---------------------------------------------------------------------------
 
-export type LlmProvider =
-  | 'anthropic'
-  | 'openai'
-  | 'openrouter'
-  | 'vercel-gateway'
-  | 'custom';
+// `LlmProvider` is re-exported from `@/lib/settings/resolve` at the
+// top of this file — that's the canonical definition shared with the
+// settings resolver and the `mastraFor` facade.
 
 export type LlmProbeResult = ProbeResult<{
   models: string[];
 }>;
 
 /**
- * Validates an LLM API key by listing available models. The endpoint
- * differs per provider; we normalize the response to a list of model
- * IDs so the wizard's "Pick a default model" step can populate its
- * select directly.
+ * Endpoints we have to hardcode because no SDK exposes them.
+ *
+ * `@ai-sdk/anthropic` and `@ai-sdk/openai` keep their default base URLs
+ * inside the bundled provider factories and do not export them as
+ * constants or attach them to the runtime provider object. Mastra's
+ * `PROVIDER_REGISTRY` also leaves the `url` field empty for these two.
+ * So this is the single, labeled place those URLs live.
+ *
+ * Used only for the connectivity probe — the model list still comes
+ * from Mastra's `getProviderConfig`.
+ */
+const PROBE_ENDPOINTS = {
+  anthropic: {
+    url: 'https://api.anthropic.com/v1/models',
+    headers: (apiKey: string): Record<string, string> => ({
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    }),
+  },
+  openai: {
+    url: 'https://api.openai.com/v1/models',
+    headers: (apiKey: string): Record<string, string> => ({
+      Authorization: `Bearer ${apiKey}`,
+    }),
+  },
+} as const;
+
+/**
+ * Validates an LLM API key and returns the list of available models so
+ * the wizard's "Pick a default model" step can populate its select
+ * without a second round-trip.
  *
  * For `custom` (OpenAI-compatible endpoints like Ollama, LM Studio,
  * vLLM, private deployments) the caller passes a base URL.
@@ -85,43 +136,79 @@ export async function probeLlm(
   }
 
   try {
-    let url: string;
-    let headers: Record<string, string>;
-
-    switch (provider) {
-      case 'anthropic':
-        url = 'https://api.anthropic.com/v1/models';
-        headers = {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
+    // Vercel AI Gateway: the AI SDK ships a first-class helper, so we
+    // never have to know the gateway URL or parse its response shape.
+    if (provider === 'vercel-gateway') {
+      const gateway = createGateway({ apiKey });
+      const meta = await gateway.getAvailableModels();
+      const models = meta.models.map((m) => m.id);
+      if (models.length === 0) {
+        return {
+          ok: false,
+          error: 'Connected, but no models returned. Check your API access tier.',
         };
-        break;
-      case 'openai':
-        url = 'https://api.openai.com/v1/models';
-        headers = { Authorization: `Bearer ${apiKey}` };
-        break;
-      case 'openrouter':
-        url = 'https://openrouter.ai/api/v1/models';
-        headers = { Authorization: `Bearer ${apiKey}` };
-        break;
-      case 'vercel-gateway':
-        url = 'https://ai-gateway.vercel.sh/v1/models';
-        headers = { Authorization: `Bearer ${apiKey}` };
-        break;
-      case 'custom': {
-        if (!customBaseUrl) {
-          return {
-            ok: false,
-            error: 'Custom provider requires a base URL',
-          };
-        }
-        url = `${customBaseUrl.replace(/\/$/, '')}/v1/models`;
-        headers = { Authorization: `Bearer ${apiKey}` };
-        break;
       }
+      return { ok: true, models };
     }
 
-    const res = await fetchJson(url, { method: 'GET', headers });
+    // Custom OpenAI-compatible endpoint (LMStudio, vLLM, …): we have
+    // to talk to the user-supplied base URL because Mastra has no
+    // entry for private deployments.
+    if (provider === 'custom') {
+      if (!customBaseUrl) {
+        return { ok: false, error: 'Custom provider requires a base URL' };
+      }
+      const url = `${customBaseUrl.replace(/\/$/, '')}/models`;
+      const res = await fetchJson(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        return {
+          ok: false,
+          error: `Provider returned HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ''}`,
+        };
+      }
+      const models = extractModelIds(await res.json());
+      if (models.length === 0) {
+        return {
+          ok: false,
+          error: 'Connected, but no models returned. Check your API access tier.',
+        };
+      }
+      return { ok: true, models };
+    }
+
+    // Anthropic / OpenAI / OpenRouter: validate the key with a cheap
+    // GET against the provider's /models endpoint, then return the
+    // model list straight from Mastra's PROVIDER_REGISTRY (which is
+    // pre-normalized — Anthropic's IDs already use the dashed form
+    // accepted by /v1/messages, so no provider-specific patching).
+    let probeUrl: string;
+    let probeHeaders: Record<string, string>;
+    if (provider === 'openrouter') {
+      // Single source of truth for the URL: Mastra's registry.
+      const cfg = getProviderConfig('openrouter');
+      const base = cfg?.url;
+      if (!base) {
+        return {
+          ok: false,
+          error: "OpenRouter is not registered in Mastra's provider registry",
+        };
+      }
+      probeUrl = `${base.replace(/\/$/, '')}/models`;
+      probeHeaders = { Authorization: `Bearer ${apiKey}` };
+    } else {
+      const ep = PROBE_ENDPOINTS[provider];
+      probeUrl = ep.url;
+      probeHeaders = ep.headers(apiKey);
+    }
+
+    const res = await fetchJson(probeUrl, {
+      method: 'GET',
+      headers: probeHeaders,
+    });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       return {
@@ -129,13 +216,16 @@ export async function probeLlm(
         error: `Provider returned HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ''}`,
       };
     }
+    // Drain the body so the connection can be reused. We deliberately
+    // do not parse it — model IDs come from the registry below.
+    await res.text().catch(() => '');
 
-    const json = (await res.json()) as unknown;
-    const models = extractModelIds(json);
+    const cfg = getProviderConfig(provider);
+    const models = cfg?.models ?? [];
     if (models.length === 0) {
       return {
         ok: false,
-        error: 'Connected, but no models returned. Check your API access tier.',
+        error: `No models registered in Mastra for provider "${provider}"`,
       };
     }
     return { ok: true, models };
@@ -145,9 +235,9 @@ export async function probeLlm(
 }
 
 function extractModelIds(json: unknown): string[] {
-  // Most providers (OpenAI / OpenRouter / Vercel Gateway / OpenAI-compat)
-  // return { data: [{ id: "..." }, ...] }. Anthropic returns
-  // { data: [{ id: "...", type: "model", ... }] }.
+  // OpenAI-compatible response shape: { data: [{ id: "..." }, ...] }.
+  // Used only for the `custom` branch; the registered providers no
+  // longer parse their /models response at all.
   if (
     typeof json === 'object' &&
     json !== null &&

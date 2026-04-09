@@ -1,5 +1,6 @@
 import 'server-only';
 
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { cache } from 'react';
 
 import { createClient } from '@/lib/supabase/server';
@@ -7,6 +8,11 @@ import { createClient } from '@/lib/supabase/server';
 /**
  * Per-user profile + onboarding state. Mirrors the `public.user_profiles`
  * table schema from migration 20260408195437_onboarding.sql.
+ *
+ * Global app config (LLM provider, ElevenLabs defaults, etc.) is no longer
+ * loaded here — see `src/lib/settings/resolve.ts` for the typed,
+ * Zod-validated settings resolver that walks Tier 1 (`app_settings`) over
+ * Tier 0 (`src/lib/defaults.ts`).
  */
 export type UserProfile = {
   userId: string;
@@ -20,42 +26,6 @@ export type UserProfile = {
 
   createdAt: Date;
   updatedAt: Date;
-};
-
-/**
- * Global app-setup + provider config. Read from `public.app_settings`.
- *
- * The wizard writes one row per key in `app_settings`; this loader pulls
- * everything that is relevant to runtime in a single query so the proxy
- * onboarding gate and the chat route handler don't make N round-trips.
- */
-export type AppConfig = {
-  setupCompletedAt: Date | null;
-
-  llm: {
-    provider: 'anthropic' | 'openai' | 'openrouter' | 'vercel-gateway' | 'custom' | null;
-    customBaseUrl: string | null;
-    defaultTextModel: string | null;
-  };
-
-  imageVideo: {
-    provider: 'vercel-gateway' | null;
-    baseUrl: string | null;
-  };
-
-  elevenlabs: {
-    configured: boolean;
-    voiceIdOverride: string | null;
-    modelIdOverride: string | null;
-  };
-
-  telegram: {
-    configured: boolean;
-  };
-
-  composio: {
-    configured: boolean;
-  };
 };
 
 // ---------------------------------------------------------------------------
@@ -78,72 +48,38 @@ export const loadProfile = cache(
     }
     if (!data) return null;
 
-    return {
-      userId: data.user_id,
-      nickname: data.nickname,
-      userPreferences: data.user_preferences,
-      bootstrapThreadId: data.bootstrap_thread_id,
-      onboardingCompletedAt: data.onboarding_completed_at
-        ? new Date(data.onboarding_completed_at)
-        : null,
-      onboardingSkippedAt: data.onboarding_skipped_at
-        ? new Date(data.onboarding_skipped_at)
-        : null,
-      createdAt: new Date(data.created_at),
-      updatedAt: new Date(data.updated_at),
-    };
+    return rowToProfile(data);
   },
 );
 
 // ---------------------------------------------------------------------------
-// loadAppConfig() — admin-only via app_settings RLS
+// Service-role variants — for headless entry points (Telegram webhook etc.)
 // ---------------------------------------------------------------------------
+//
+// These are NOT cached: they're called from request handlers that have no
+// React-cache lifecycle. They're also intentionally separate functions so
+// every call site is forced to think about *which* client it's passing —
+// the cookie-bound one (which respects RLS) or the service-role one (which
+// bypasses it). See `src/lib/supabase/service.ts` for the discipline.
 
-export const loadAppConfig = cache(async (): Promise<AppConfig> => {
-  const supabase = await createClient();
+export async function loadProfileAsService(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<UserProfile | null> {
   const { data, error } = await supabase
-    .from('app_settings')
-    .select('key, value');
+    .from('user_profiles')
+    .select(
+      'user_id, nickname, user_preferences, bootstrap_thread_id, onboarding_completed_at, onboarding_skipped_at, created_at, updated_at',
+    )
+    .eq('user_id', userId)
+    .maybeSingle();
 
   if (error) {
-    throw new Error(`loadAppConfig() failed: ${error.message}`);
+    throw new Error(`loadProfileAsService(${userId}) failed: ${error.message}`);
   }
-
-  const map = new Map<string, unknown>(
-    (data ?? []).map((row) => [row.key as string, row.value]),
-  );
-
-  const get = <T>(key: string): T | null => {
-    const v = map.get(key);
-    return (v ?? null) as T | null;
-  };
-
-  const setupCompletedAtRaw = get<string>('app.setup_completed_at');
-
-  return {
-    setupCompletedAt: setupCompletedAtRaw ? new Date(setupCompletedAtRaw) : null,
-    llm: {
-      provider: get<AppConfig['llm']['provider']>('llm.default_provider'),
-      customBaseUrl: get<string>('llm.custom_base_url'),
-      defaultTextModel: get<string>('llm.default_text_model'),
-    },
-    imageVideo: {
-      provider: get<AppConfig['imageVideo']['provider']>('image_video.provider'),
-      baseUrl: get<string>('image_video.base_url'),
-    },
-    elevenlabs: {
-      configured: get<boolean>('elevenlabs.configured') ?? false,
-      voiceIdOverride: get<string>('elevenlabs.voice_id_override'),
-      modelIdOverride: get<string>('elevenlabs.model_id_override'),
-    },
-    telegram: {
-      configured: get<boolean>('telegram.configured') ?? false,
-    },
-    composio: {
-      configured: get<boolean>('composio.configured') ?? false,
-    },
-  };
-});
+  if (!data) return null;
+  return rowToProfile(data);
+}
 
 /**
  * Lightweight gate-only loader used by the proxy. Returns just the two
@@ -178,4 +114,36 @@ export async function loadOnboardingState(userId: string): Promise<{
   );
 
   return { appSetupCompleted, userOnboardingResolved };
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+type UserProfileRow = {
+  user_id: string;
+  nickname: string | null;
+  user_preferences: string | null;
+  bootstrap_thread_id: string | null;
+  onboarding_completed_at: string | null;
+  onboarding_skipped_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function rowToProfile(data: UserProfileRow): UserProfile {
+  return {
+    userId: data.user_id,
+    nickname: data.nickname,
+    userPreferences: data.user_preferences,
+    bootstrapThreadId: data.bootstrap_thread_id,
+    onboardingCompletedAt: data.onboarding_completed_at
+      ? new Date(data.onboarding_completed_at)
+      : null,
+    onboardingSkippedAt: data.onboarding_skipped_at
+      ? new Date(data.onboarding_skipped_at)
+      : null,
+    createdAt: new Date(data.created_at),
+    updatedAt: new Date(data.updated_at),
+  };
 }

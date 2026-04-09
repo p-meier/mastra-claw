@@ -1,9 +1,19 @@
 import { z } from 'zod';
 
 /**
- * Layer A bootstrap env vars — the only ones MastraClaw reads at process
- * start. Everything else (LLM keys, ElevenLabs, Telegram bot tokens, etc.)
- * lives in Supabase Vault and is loaded per-user at runtime via SecretService.
+ * Layer A bootstrap env vars — the **only** ones MastraClaw reads at
+ * process start.
+ *
+ * Rule: a value lives here only if it is **secret AND needed before
+ * Postgres is reachable**. Everything else has a better home:
+ *
+ *   - Per-deployment defaults (model names, voice IDs, polling
+ *     intervals, …) → `src/lib/defaults.ts` (Tier 0) with admin
+ *     overrides in `app_settings` (Tier 1, see
+ *     `src/lib/settings/resolve.ts`).
+ *   - Per-user secrets (LLM API keys, ElevenLabs key, Telegram bot
+ *     token, Composio key, …) → Supabase Vault via `SecretService`.
+ *   - Per-user non-secret overrides → future `user_settings` table.
  *
  * See ARCHITECTURE.md §11 (Secrets — Two Layers) and CLAUDE.md.
  *
@@ -40,16 +50,6 @@ const schema = z.object({
   SUPABASE_S3_ENDPOINT: z.string().url().optional(),
   SUPABASE_S3_ACCESS_KEY_ID: z.string().min(1).optional(),
   SUPABASE_S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
-
-  // === Optional model defaults (override via stored agent config) ===
-  MAIN_AGENT_MODEL: z.string().optional(),
-  SPECIALIST_MODEL: z.string().optional(),
-
-  // === ElevenLabs voice defaults ===
-  // Hard-coded per deployment, can be overridden via app_settings later
-  // (admin-only). The API key itself lives in Vault, never here.
-  ELEVENLABS_VOICE_ID: z.string().min(1),
-  ELEVENLABS_MODEL_ID: z.string().min(1),
 });
 
 const parsed = schema.safeParse(process.env);

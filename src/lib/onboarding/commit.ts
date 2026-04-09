@@ -117,7 +117,11 @@ export async function commitPersonalOnboarding(
     };
   }
 
-  // 2. user_telegram_links row, if not skipped
+  // 2. user_telegram_links row, if not skipped. The link itself is
+  // what the channel input processor uses to map an inbound Telegram
+  // message back to the MastraClaw user — channel↔agent routing is
+  // handled by Mastra's `channels` config on the agent, not by a
+  // database `bindings` table.
   if (!draft.telegramSkipped && draft.telegramUserId) {
     const telegramId = Number.parseInt(draft.telegramUserId, 10);
     const { error: linkError } = await supabase

@@ -1,23 +1,16 @@
 import 'server-only';
 
-import { gateway } from '@ai-sdk/gateway';
-import { anthropic } from '@ai-sdk/anthropic';
-import { openai } from '@ai-sdk/openai';
-import {
-  convertToModelMessages,
-  stepCountIs,
-  streamText,
-  tool,
-  type LanguageModel,
-} from 'ai';
+import type { UIMessage } from 'ai';
+import { convertToModelMessages, stepCountIs, streamText, tool } from 'ai';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
+import { toErrorResponse } from '@/app/api/_lib';
 import { getCurrentUser } from '@/lib/auth';
 import { commitPersonalOnboarding, personaSchema } from '@/lib/onboarding/commit';
 import { buildBootstrapSystem } from '@/lib/onboarding/bootstrap-prompt';
 import { createClient } from '@/lib/supabase/server';
-import { mastraFor, AppNotConfiguredError } from '@/mastra/lib/mastra-for';
+import { mastraFor } from '@/mastra/lib/mastra-for';
 
 /**
  * POST /api/onboarding/bootstrap
@@ -44,63 +37,64 @@ import { mastraFor, AppNotConfiguredError } from '@/mastra/lib/mastra-for';
  * sidesteps that entirely.
  */
 
+// Same lightweight UIMessage validator as the chat route — defends
+// against malicious payloads without trying to replicate the full
+// AI SDK v6 `UIMessage` type. The producing client (assistant-ui +
+// AI SDK v6) guarantees the full shape; the cast to `UIMessage[]`
+// goes through `unknown` so the type lie is visible.
+const uiMessageShape = z.object({
+  id: z.string(),
+  role: z.enum(['system', 'user', 'assistant']),
+  parts: z.array(z.unknown()),
+});
+
+const requestSchema = z.object({
+  messages: z.array(uiMessageShape),
+  wizardDraft: z.object({
+    tone: z.enum(['casual', 'crisp', 'friendly', 'playful']),
+    telegramSkipped: z.boolean(),
+    telegramUserId: z.string().nullable(),
+  }),
+});
+
 export async function POST(req: Request): Promise<Response> {
   const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  let body: { messages?: unknown; wizardDraft?: unknown };
+  let raw: unknown;
   try {
-    body = (await req.json()) as { messages?: unknown; wizardDraft?: unknown };
+    raw = await req.json();
   } catch {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
-  if (!Array.isArray(body.messages)) {
-    return NextResponse.json(
-      { error: 'messages array required' },
-      { status: 400 },
-    );
-  }
 
-  const wizardDraftSchema = z.object({
-    tone: z.enum(['casual', 'crisp', 'friendly', 'playful']),
-    telegramSkipped: z.boolean(),
-    telegramUserId: z.string().nullable(),
-  });
-  const wizardDraftParse = wizardDraftSchema.safeParse(body.wizardDraft);
-  if (!wizardDraftParse.success) {
+  const parsed = requestSchema.safeParse(raw);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: 'Invalid or missing wizardDraft in request body' },
+      { error: 'Invalid request body', issues: parsed.error.issues },
       { status: 400 },
     );
   }
-  const wizardDraft = wizardDraftParse.data;
+  const { messages, wizardDraft } = parsed.data;
 
   const facade = mastraFor(user);
 
-  let creds;
+  let model;
   try {
-    creds = await facade.getLlmCredentials();
+    model = await facade.getLanguageModel();
   } catch (err) {
-    if (err instanceof AppNotConfiguredError) {
-      return NextResponse.json({ error: err.message }, { status: 503 });
-    }
-    throw err;
+    return toErrorResponse(err);
   }
-
-  const model = buildModel(
-    creds.provider,
-    creds.apiKey,
-    creds.defaultModel,
-    creds.baseUrl,
-  );
 
   // Capture the supabase client BEFORE streamText so the tool execute
   // doesn't have to call cookies() in a context where it might be lost.
   const supabase = await createClient();
 
-  const modelMessages = await convertToModelMessages(body.messages as never);
+  const modelMessages = await convertToModelMessages(
+    messages as unknown as UIMessage[],
+  );
 
   const result = streamText({
     model,
@@ -132,35 +126,6 @@ export async function POST(req: Request): Promise<Response> {
   });
 
   return result.toUIMessageStreamResponse();
-}
-
-function buildModel(
-  provider: string,
-  apiKey: string,
-  modelId: string,
-  baseUrl: string | null,
-): LanguageModel {
-  switch (provider) {
-    case 'anthropic':
-      process.env.ANTHROPIC_API_KEY = apiKey;
-      return anthropic(modelId);
-    case 'openai':
-      process.env.OPENAI_API_KEY = apiKey;
-      return openai(modelId);
-    case 'vercel-gateway':
-      process.env.AI_GATEWAY_API_KEY = apiKey;
-      return gateway(modelId);
-    case 'openrouter':
-      process.env.OPENAI_API_KEY = apiKey;
-      process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1';
-      return openai(modelId);
-    case 'custom':
-      process.env.OPENAI_API_KEY = apiKey;
-      if (baseUrl) process.env.OPENAI_BASE_URL = baseUrl;
-      return openai(modelId);
-    default:
-      throw new Error(`Unsupported provider: ${provider}`);
-  }
 }
 
 export const dynamic = 'force-dynamic';

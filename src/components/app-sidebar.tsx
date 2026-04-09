@@ -11,10 +11,8 @@ import {
   CircuitBoardIcon,
   DatabaseIcon,
   GaugeIcon,
-  LifeBuoyIcon,
   LogOutIcon,
-  MessagesSquareIcon,
-  PlugIcon,
+  Settings2Icon,
   SettingsIcon,
   ShieldCheckIcon,
   SparklesIcon,
@@ -54,7 +52,7 @@ import type { CurrentUser } from "@/lib/auth"
 const nav = {
   navPlatform: [
     { title: "Dashboard", url: "/", icon: GaugeIcon },
-    { title: "Agents", url: "#", icon: BotIcon },
+    { title: "Agents", url: "/agents", icon: BotIcon },
     { title: "Workflows", url: "#", icon: WorkflowIcon },
     { title: "Tools", url: "#", icon: CircuitBoardIcon },
     { title: "Memory", url: "#", icon: DatabaseIcon },
@@ -65,11 +63,15 @@ const nav = {
     { title: "Evaluations", url: "#", icon: SparklesIcon },
     { title: "Guardrails", url: "#", icon: ShieldCheckIcon },
   ],
-  navSettings: [
-    { title: "Channels", url: "#", icon: MessagesSquareIcon },
-    { title: "Integrations", url: "#", icon: PlugIcon },
-    { title: "Settings", url: "#", icon: SettingsIcon },
-    { title: "Support", url: "#", icon: LifeBuoyIcon },
+  /**
+   * Admin-only group, gated below by `currentUser.role === 'admin'`.
+   * Server-rendered: a non-admin never sees these links in the
+   * markup. Defense in depth — every page below also enforces
+   * `requireAdmin()` server-side.
+   */
+  navAdmin: [
+    { title: "Admin Settings", url: "/admin/settings", icon: Settings2Icon },
+    { title: "Setup Wizard", url: "/admin/setup", icon: ShieldCheckIcon },
   ],
 } as const
 
@@ -161,23 +163,25 @@ export function AppSidebar({ currentUser }: { currentUser: CurrentUser }) {
           </SidebarGroupContent>
         </SidebarGroup>
 
-        <SidebarGroup className="mt-auto">
-          <SidebarGroupLabel>Workspace</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {nav.navSettings.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild tooltip={item.title}>
-                    <Link href={item.url}>
-                      <item.icon />
-                      <span>{item.title}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {currentUser.role === "admin" ? (
+          <SidebarGroup className="mt-auto">
+            <SidebarGroupLabel>Admin</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {nav.navAdmin.map((item) => (
+                  <SidebarMenuItem key={item.title}>
+                    <SidebarMenuButton asChild tooltip={item.title}>
+                      <Link href={item.url}>
+                        <item.icon />
+                        <span>{item.title}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
       </SidebarContent>
 
       <SidebarFooter>

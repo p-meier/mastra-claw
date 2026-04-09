@@ -1,23 +1,18 @@
 import 'server-only';
 
-import { gateway } from '@ai-sdk/gateway';
-import { anthropic } from '@ai-sdk/anthropic';
-import { openai } from '@ai-sdk/openai';
-import {
-  convertToModelMessages,
-  generateObject,
-  type LanguageModel,
-} from 'ai';
+import type { UIMessage } from 'ai';
+import { convertToModelMessages, generateObject } from 'ai';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
+import { toErrorResponse } from '@/app/api/_lib';
 import { getCurrentUser } from '@/lib/auth';
 import {
   commitPersonalOnboarding,
   personaSchema,
 } from '@/lib/onboarding/commit';
 import { createClient } from '@/lib/supabase/server';
-import { mastraFor, AppNotConfiguredError } from '@/mastra/lib/mastra-for';
+import { mastraFor } from '@/mastra/lib/mastra-for';
 
 /**
  * POST /api/onboarding/bootstrap/finalize
@@ -86,8 +81,14 @@ Rules:
 - Aim for 10–25 lines. Information density beats length.`;
 }
 
+const uiMessageShape = z.object({
+  id: z.string(),
+  role: z.enum(['system', 'user', 'assistant']),
+  parts: z.array(z.unknown()),
+});
+
 const requestSchema = z.object({
-  messages: z.array(z.unknown()),
+  messages: z.array(uiMessageShape),
   wizardDraft: z.object({
     tone: z.enum(['casual', 'crisp', 'friendly', 'playful']),
     telegramSkipped: z.boolean(),
@@ -119,26 +120,18 @@ export async function POST(req: Request): Promise<Response> {
 
   const facade = mastraFor(user);
 
-  let creds;
+  let model;
   try {
-    creds = await facade.getLlmCredentials();
+    model = await facade.getLanguageModel();
   } catch (err) {
-    if (err instanceof AppNotConfiguredError) {
-      return NextResponse.json({ error: err.message }, { status: 503 });
-    }
-    throw err;
+    return toErrorResponse(err);
   }
-
-  const model = buildModel(
-    creds.provider,
-    creds.apiKey,
-    creds.defaultModel,
-    creds.baseUrl,
-  );
 
   // Convert UI messages → model messages so generateObject sees the
   // same conversation the user has been having in the chat.
-  const modelMessages = await convertToModelMessages(messages as never);
+  const modelMessages = await convertToModelMessages(
+    messages as unknown as UIMessage[],
+  );
 
   let persona;
   try {
@@ -150,9 +143,9 @@ export async function POST(req: Request): Promise<Response> {
     });
     persona = obj.object;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[onboarding/bootstrap/finalize] generateObject failed', err);
     return NextResponse.json(
-      { error: `Failed to summarize interview: ${msg}` },
+      { error: 'Failed to summarize interview. Please try again.' },
       { status: 500 },
     );
   }
@@ -169,35 +162,6 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   return NextResponse.json({ ok: true, persona });
-}
-
-function buildModel(
-  provider: string,
-  apiKey: string,
-  modelId: string,
-  baseUrl: string | null,
-): LanguageModel {
-  switch (provider) {
-    case 'anthropic':
-      process.env.ANTHROPIC_API_KEY = apiKey;
-      return anthropic(modelId);
-    case 'openai':
-      process.env.OPENAI_API_KEY = apiKey;
-      return openai(modelId);
-    case 'vercel-gateway':
-      process.env.AI_GATEWAY_API_KEY = apiKey;
-      return gateway(modelId);
-    case 'openrouter':
-      process.env.OPENAI_API_KEY = apiKey;
-      process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1';
-      return openai(modelId);
-    case 'custom':
-      process.env.OPENAI_API_KEY = apiKey;
-      if (baseUrl) process.env.OPENAI_BASE_URL = baseUrl;
-      return openai(modelId);
-    default:
-      throw new Error(`Unsupported provider: ${provider}`);
-  }
 }
 
 export const dynamic = 'force-dynamic';

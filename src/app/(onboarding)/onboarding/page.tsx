@@ -1,7 +1,8 @@
 import { redirect } from 'next/navigation';
 
 import { getCurrentUser } from '@/lib/auth';
-import { loadAppConfig, loadProfile } from '@/lib/onboarding/profile';
+import { loadProfile } from '@/lib/onboarding/profile';
+import { resolveSettings } from '@/lib/settings/resolve';
 
 import { OnboardingWizard } from './_components/onboarding-wizard';
 
@@ -29,15 +30,15 @@ export default async function PersonalOnboardingPage() {
   const user = await getCurrentUser();
   if (!user) redirect('/login');
 
-  const [profile, appConfig] = await Promise.all([
+  const [profile, settings] = await Promise.all([
     loadProfile(user.userId),
-    loadAppConfig(),
+    resolveSettings(),
   ]);
 
   // App-level setup not yet done. Without an LLM provider configured,
   // the bootstrap chat would just throw "LLM provider/model missing"
   // the moment the user starts talking — so block here instead.
-  if (!appConfig.setupCompletedAt) {
+  if (!settings.app.setupCompletedAt) {
     redirect(user.role === 'admin' ? '/admin/setup' : '/not-configured');
   }
 
@@ -49,7 +50,7 @@ export default async function PersonalOnboardingPage() {
 
   return (
     <OnboardingWizard
-      telegramConfiguredOnInstance={appConfig.telegram.configured}
+      telegramConfiguredOnInstance={settings.telegram.configured}
     />
   );
 }

@@ -1,10 +1,24 @@
 import 'server-only';
 
+import type { LanguageModelV3 } from '@ai-sdk/provider-v6';
+import type { Agent } from '@mastra/core/agent';
+import type { StorageThreadType } from '@mastra/core/memory';
+import type { UIMessage } from 'ai';
+
 import type { CurrentUser } from '@/lib/auth';
-import { loadAppConfig, loadProfile, type AppConfig, type UserProfile } from '@/lib/onboarding/profile';
-import { env } from '@/lib/env';
+import { loadProfile, type UserProfile } from '@/lib/onboarding/profile';
+import { createClient } from '@/lib/supabase/server';
+import { resolveSettings, type ResolvedSettings } from '@/lib/settings/resolve';
 
 import { mastra } from '@/mastra';
+import {
+  getAgentForUser,
+  listAgentThreadsForUser,
+  listAgentsForUser,
+  loadThreadMessagesForUser,
+} from './agents-service';
+import { loadLlmCredentials, type LlmCredentials } from './llm-credentials';
+import { resolveLanguageModel } from './resolve-language-model';
 import { appSecrets, userSecrets, APP_SECRET_NAMES } from './secret-service';
 
 /**
@@ -20,10 +34,11 @@ import { appSecrets, userSecrets, APP_SECRET_NAMES } from './secret-service';
  *     mastraFor(user).secrets         user-scoped Vault namespace
  *     mastraFor(user).appSecrets      admin-only Vault namespace
  *     mastraFor(user).profile()       loadProfile(user.userId)
- *     mastraFor(user).appConfig()     loadAppConfig()
+ *     mastraFor(user).settings()      resolveSettings()
  *     mastraFor(user).getLlmCredentials()
  *     mastraFor(user).getImageVideoCredentials()
  *     mastraFor(user).getElevenlabs()
+ *     mastraFor(user).agents          per-user agent enumeration
  *     mastraFor(user).raw             escape hatch — pass-through to mastra
  *
  * The full editor facade (agents/prompts/skills/mcp/scorers CRUD with
@@ -31,22 +46,16 @@ import { appSecrets, userSecrets, APP_SECRET_NAMES } from './secret-service';
  */
 
 // ---------------------------------------------------------------------------
-// Resolved-credential return types
+// Re-exports — keep call sites pointing at this file
 // ---------------------------------------------------------------------------
 
-export type LlmProvider =
-  | 'anthropic'
-  | 'openai'
-  | 'openrouter'
-  | 'vercel-gateway'
-  | 'custom';
+export { AppNotConfiguredError } from './llm-credentials';
+export type { LlmCredentials } from './llm-credentials';
+export type { LlmProvider } from '@/lib/settings/resolve';
 
-export type LlmCredentials = {
-  provider: LlmProvider;
-  apiKey: string;
-  defaultModel: string;
-  baseUrl: string | null;
-};
+// ---------------------------------------------------------------------------
+// Resolved-credential return types
+// ---------------------------------------------------------------------------
 
 export type ImageVideoCredentials = {
   provider: 'vercel-gateway';
@@ -61,22 +70,26 @@ export type ElevenlabsCredentials = {
 };
 
 // ---------------------------------------------------------------------------
-// Custom error types
-// ---------------------------------------------------------------------------
-
-export class AppNotConfiguredError extends Error {
-  constructor(what: string) {
-    super(`MastraClaw is not yet configured: ${what} missing`);
-    this.name = 'AppNotConfiguredError';
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 export function mastraFor(currentUser: CurrentUser) {
   const userId = currentUser.userId;
+
+  /**
+   * Resolve the active text-LLM credentials for this request.
+   *
+   * Routes through the shared `loadLlmCredentials()` helper so the
+   * Telegram channel processor and any other headless entry point uses
+   * the same lookup chain (Tier 1 `app_settings` → Tier 0 defaults → Vault
+   * API key). Throws `AppNotConfiguredError` when the API key is missing
+   * — call sites should catch and either redirect to the admin setup
+   * wizard or show an inline error.
+   */
+  const getLlmCredentials = async (): Promise<LlmCredentials> => {
+    const supabase = await createClient();
+    return loadLlmCredentials(supabase);
+  };
 
   return {
     /** Per-user Vault namespace (Layer C). */
@@ -92,38 +105,32 @@ export function mastraFor(currentUser: CurrentUser) {
     /** Load this user's profile row (cached per request via react.cache). */
     profile: (): Promise<UserProfile | null> => loadProfile(userId),
 
-    /** Load the global app config row set (cached per request). */
-    appConfig: (): Promise<AppConfig> => loadAppConfig(),
+    /** Resolved app-level settings (Tier 1 over Tier 0 defaults, cached). */
+    settings: (): Promise<ResolvedSettings> => resolveSettings(),
+
+    getLlmCredentials,
 
     /**
-     * Resolve the active text-LLM credentials for this request.
+     * Resolve a fully-instantiated `LanguageModelV3` for this request.
      *
-     * Lookup precedence:
-     *   1. user-override secret (Layer C, future)            ← not yet exposed
-     *   2. app-level secret (Layer B)                         ← Phase 1 default
+     * This is the **only** sanctioned way to obtain a Vercel AI SDK model
+     * inside MastraClaw. It chains `getLlmCredentials()` → the central
+     * `resolveLanguageModel()` factory, which uses per-call provider
+     * factories (`createAnthropic({ apiKey })` etc.) so nothing ever
+     * mutates `process.env`. Concurrent requests with different per-user
+     * keys are isolated by construction.
      *
-     * The provider, model, and base URL come from `app_settings` (Layer
-     * B config table). Throws `AppNotConfiguredError` if any required
-     * piece is missing — call sites should catch and either redirect to
-     * the admin setup wizard or show an inline error.
+     * Throws `AppNotConfiguredError` (mapped to HTTP 503 by the API
+     * boundary helper) if the admin setup wizard hasn't run yet.
      */
-    getLlmCredentials: async (): Promise<LlmCredentials> => {
-      const cfg = await loadAppConfig();
-      if (!cfg.llm.provider || !cfg.llm.defaultTextModel) {
-        throw new AppNotConfiguredError('LLM provider/model');
-      }
-
-      const apiKey = await appSecrets.get(APP_SECRET_NAMES.llmApiKey);
-      if (!apiKey) {
-        throw new AppNotConfiguredError('LLM API key');
-      }
-
-      return {
-        provider: cfg.llm.provider,
-        apiKey,
-        defaultModel: cfg.llm.defaultTextModel,
-        baseUrl: cfg.llm.customBaseUrl,
-      };
+    getLanguageModel: async (): Promise<LanguageModelV3> => {
+      const creds = await getLlmCredentials();
+      return resolveLanguageModel({
+        provider: creds.provider,
+        apiKey: creds.apiKey,
+        modelId: creds.defaultModel,
+        baseUrl: creds.baseUrl,
+      });
     },
 
     /**
@@ -135,41 +142,47 @@ export function mastraFor(currentUser: CurrentUser) {
      * Returns `null` if image/video was skipped during admin setup.
      */
     getImageVideoCredentials: async (): Promise<ImageVideoCredentials | null> => {
-      const cfg = await loadAppConfig();
+      const settings = await resolveSettings();
 
       // Auto-share if text provider is already Vercel AI Gateway
-      if (cfg.llm.provider === 'vercel-gateway') {
+      if (settings.llm.provider === 'vercel-gateway') {
         const apiKey = await appSecrets.get(APP_SECRET_NAMES.llmApiKey);
         if (!apiKey) return null;
-        return { provider: 'vercel-gateway', apiKey, baseUrl: cfg.imageVideo.baseUrl };
+        return {
+          provider: 'vercel-gateway',
+          apiKey,
+          baseUrl: settings.imageVideo.baseUrl,
+        };
       }
 
-      if (!cfg.imageVideo.provider) return null;
+      if (!settings.imageVideo.provider) return null;
       const apiKey = await appSecrets.get(APP_SECRET_NAMES.imageVideoApiKey);
       if (!apiKey) return null;
       return {
-        provider: cfg.imageVideo.provider,
+        provider: settings.imageVideo.provider,
         apiKey,
-        baseUrl: cfg.imageVideo.baseUrl,
+        baseUrl: settings.imageVideo.baseUrl,
       };
     },
 
     /**
      * Resolve ElevenLabs credentials. Voice ID and model ID come from
-     * env defaults but can be overridden by `app_settings` (admin-only).
-     * Returns null if ElevenLabs was skipped during admin setup.
+     * Tier 0 defaults (`src/lib/defaults.ts`) and can be overridden via
+     * `app_settings` from /admin/settings — both layers go through
+     * `resolveSettings()`, no env vars involved. Returns null if
+     * ElevenLabs was skipped during admin setup.
      */
     getElevenlabs: async (): Promise<ElevenlabsCredentials | null> => {
-      const cfg = await loadAppConfig();
-      if (!cfg.elevenlabs.configured) return null;
+      const settings = await resolveSettings();
+      if (!settings.elevenlabs.configured) return null;
 
       const apiKey = await appSecrets.get(APP_SECRET_NAMES.elevenlabsApiKey);
       if (!apiKey) return null;
 
       return {
         apiKey,
-        voiceId: cfg.elevenlabs.voiceIdOverride ?? env.ELEVENLABS_VOICE_ID,
-        modelId: cfg.elevenlabs.modelIdOverride ?? env.ELEVENLABS_MODEL_ID,
+        voiceId: settings.elevenlabs.voiceId,
+        modelId: settings.elevenlabs.modelId,
       };
     },
 
@@ -179,8 +192,8 @@ export function mastraFor(currentUser: CurrentUser) {
      * Links at chat time — they don't go through this surface.
      */
     getComposioApiKey: async (): Promise<string | null> => {
-      const cfg = await loadAppConfig();
-      if (!cfg.composio.configured) return null;
+      const settings = await resolveSettings();
+      if (!settings.composio.configured) return null;
       return appSecrets.get(APP_SECRET_NAMES.composioApiKey);
     },
 
@@ -189,9 +202,32 @@ export function mastraFor(currentUser: CurrentUser) {
      * skipped during admin setup.
      */
     getTelegramBotToken: async (): Promise<string | null> => {
-      const cfg = await loadAppConfig();
-      if (!cfg.telegram.configured) return null;
+      const settings = await resolveSettings();
+      if (!settings.telegram.configured) return null;
       return appSecrets.get(APP_SECRET_NAMES.telegramBotToken);
+    },
+
+    /**
+     * Per-user agent enumeration. Phase 1 ships only code-defined agents
+     * — every authenticated user sees the same registry. When stored
+     * agents land later, this namespace gains `authorId` filtering for
+     * the user facade and admins keep the unfiltered view.
+     *
+     * Returns `Agent` instances from `@mastra/core/agent` — the same
+     * type Mastra itself uses. The route handlers extract just the
+     * fields they need to JSON-serialize.
+     */
+    agents: {
+      list: (): Promise<Agent[]> => listAgentsForUser(currentUser),
+      get: (agentId: string): Promise<Agent | null> =>
+        getAgentForUser(currentUser, agentId),
+      listThreads: (agentId: string): Promise<StorageThreadType[]> =>
+        listAgentThreadsForUser(currentUser, agentId),
+      loadThreadMessages: (
+        agentId: string,
+        threadId: string,
+      ): Promise<UIMessage[] | null> =>
+        loadThreadMessagesForUser(currentUser, agentId, threadId),
     },
 
     /**

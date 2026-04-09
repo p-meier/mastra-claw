@@ -38,6 +38,7 @@ The hybrid pattern solves the compound error problem (95% per-step accuracy degr
 | Evaluations | `@mastra/evals` | Built-in scorers |
 | MCP Integration | Mastra MCP client (stored MCP connections) | Dynamic tool acquisition without code changes |
 | Validation | Zod | Schema validation for all tool inputs/outputs and API boundaries |
+| Chat UI | `@assistant-ui/react` + `@assistant-ui/react-ai-sdk` + `@assistant-ui/react-streamdown` (built on Vercel AI SDK + `streamdown`) | Single library for every LLM chat surface in the app — per-agent chat, onboarding bootstrap, future surfaces |
 
 **Explicitly not used:** Convex, LibSQL (no degraded local fallback), Vercel Chat SDK, Doppler, Composio (Phase 1), separate API service.
 
@@ -282,11 +283,60 @@ mastra-claw/
 - All model references go through Vercel AI SDK's model routing
 - Supports: Vercel AI Gateway, OpenRouter, all major cloud providers, and private/on-premise model APIs
 
+### API Route Boundary
+Every authenticated route under `src/app/api/` MUST go through `withAuthenticatedRoute` from `@/app/api/_lib`. This single chokepoint handles:
+- `getCurrentUser()` → 401 if missing
+- Optional `requireAdmin: true` → 403 via `AdminRequiredError`
+- `mastraFor(user)` facade construction
+- Optional `requireProfile: true` → 409 via `ProfileRequiredError`
+- Optional `bodySchema` (Zod) → 400 with issue details
+- Centralized error mapping via `toErrorResponse` (`AppNotConfiguredError` → 503, `WorkspacePathError` → 400, `WorkspaceNotConfiguredError` → 503, `ZodError` → 400, fallthrough → 500)
+
+```ts
+export const GET = withAuthenticatedRoute<{ agentId: string }>({
+  handler: async ({ facade, params }) => {
+    const agent = await facade.agents.get(params.agentId);
+    if (!agent) return NextResponse.json({ error: 'not found' }, { status: 404 });
+    return NextResponse.json({ agent });
+  },
+});
+```
+
+Direct calls to `getCurrentUser()` or `mastraFor()` from inside a route handler are a code smell — review and convert. The only sanctioned exceptions are unauthenticated webhook receivers (Telegram, etc.) and the onboarding bootstrap routes that run before the user has a profile.
+
+### Language Model Instantiation
+There is exactly one path to obtain a Vercel AI SDK `LanguageModel` in MastraClaw:
+
+```ts
+const model = await mastraFor(user).getLanguageModel();
+// or, when called from inside a Mastra agent's model resolver:
+import { resolveLanguageModel } from '@/mastra/lib/resolve-language-model';
+model: ({ requestContext }) => resolveLanguageModel(llm),
+```
+
+Both go through `src/mastra/lib/resolve-language-model.ts`, which uses per-call provider factories (`createAnthropic({ apiKey })`, `createOpenAI({ apiKey })`, etc.) so nothing ever touches `process.env`. This is the only race-safe pattern under concurrent traffic with different per-user keys.
+
+**NEVER** import the global provider singletons (`anthropic`, `openai`, `gateway` from `@ai-sdk/*`) as values, and **NEVER** assign API keys into `process.env`. Both patterns are sources of cross-tenant key leakage and are forbidden by the Do NOT section. Type-only imports (`type LanguageModel`) remain allowed.
+
 ### Small Codebase Philosophy
 - The core codebase must stay minimal — complexity lives in frameworks and packages
 - New capabilities are added as workflows, tools, and skills — not as core code changes
 - Upstream updates should be dependency bumps, not source code rewrites
 - If a package or framework provides a feature, use it — don't reimplement
+
+### Reuse Mastra Types — Don't Invent Parallel DTOs
+Across the Mastra-facing service layer (`src/mastra/lib/agents-service.ts`, `workspace-service.ts`, the `mastraFor()` facade in `mastra-for.ts`, anywhere that touches `mastra.listAgents()`, `Memory`, `Workflow`, …), **reuse the types exported by `@mastra/core/*` and `@mastra/memory` directly**. Do not introduce parallel types like `AgentSummary`, `AgentDetail`, `AgentThread`, `AgentUIMessage`, etc. when an upstream shape is usable.
+
+Concretely:
+- `findAgentById(id)` and the facade's `agents.get(id)` return the actual `Agent` instance from `@mastra/core/agent`, never `any` and never a wrapper interface.
+- Memory thread reads return `StorageThreadType` from `@mastra/core/memory`. Memory message reads return `MastraDBMessage[]` (also from `@mastra/core/agent`) at the storage boundary, converted to `UIMessage` from `ai` at the chat-UI boundary.
+- For chat-UI message shapes, use `UIMessage` from `ai` — that's what `useChatRuntime` consumes via `@assistant-ui/react-ai-sdk`, so a single canonical type flows from Mastra DB → server conversion → chat client.
+- Workspace operations use `S3Filesystem` / Mastra workspace types from `@mastra/core/workspace`, not `any` casts.
+- The same rule applies inside the `mastraFor()` facade itself: prefer Mastra-typed return values over hand-rolled wrappers.
+
+A custom narrow DTO is only acceptable when the **UI genuinely needs less than what Mastra returns AND exposing the full type would force the client to know about server-only fields**. In that case the DTO is a `Pick<MastraType, ...>` of the upstream type, not a hand-rolled interface. When in doubt, check the existing example: `src/mastra/lib/agents-service.ts` is the reference implementation — if you find yourself adding `eslint-disable @typescript-eslint/no-explicit-any`, you're doing it wrong; import the right Mastra type instead.
+
+**Why:** Custom DTOs drift from upstream. Every Mastra version bump becomes a manual reconciliation pass and a class of silent-corruption bugs at the persistence boundary. `@mastra/core` is the contract; mirror it instead of paraphrasing it.
 
 ### Agent Definitions
 ```typescript
@@ -339,6 +389,12 @@ const tool = createTool({
   execute: async (input) => { ... },
 });
 ```
+
+### Chat UI
+- **One library, one way.** Every LLM chat surface — per-agent chat, the onboarding bootstrap interview, any future chat-shaped UI — uses `@assistant-ui/react` with `useChatRuntime` from `@assistant-ui/react-ai-sdk`. Custom JSX wraps `ThreadPrimitive` / `ComposerPrimitive` / `MessagePrimitive` for layout and styling. assistant-ui sits on top of the Vercel AI SDK and `streamdown`, so the Vercel-first primitive rule still holds.
+- Render assistant text via `MarkdownText` (`src/components/assistant-ui/markdown-text.tsx`), which is backed by `@assistant-ui/react-streamdown` + `streamdown` plugins (`@streamdown/code`, `@streamdown/mermaid`). Code highlighting and mid-stream tolerance are consistent everywhere.
+- Reference implementation: `src/components/agent/agent-chat.tsx`.
+- The transport (`AssistantChatTransport`) can target either a Mastra agent route (`handleChatStream` from `@mastra/ai-sdk`, see `src/app/api/agents/[agentId]/chat/route.ts`) or a plain `streamText` route that emits an AI SDK v6 UI message stream (see `src/app/api/onboarding/bootstrap/route.ts`). Both shapes are supported by the same client.
 
 ## Commands
 
@@ -498,3 +554,7 @@ Processors are composable and can be stacked. Apply them as input processors (pr
 - **Don't create role-based sub-agents** as a substitute for context firewalls. Use fresh contexts per task where appropriate.
 - **Don't write verbose agent instructions.** Concise, human-written instructions outperform long LLM-generated ones (ETH Zurich finding).
 - **Don't skip `workflow.commit()`.** Every workflow definition must call `.commit()` after the step chain.
+- **Don't introduce a second chat UI library.** No `useChat` from `@ai-sdk/react` in client components, no `ai-elements` shadcn registry, no hand-rolled message lists. Every chat surface uses `@assistant-ui/react` per the "Chat UI" convention above. (Server routes may still use `streamText` from `ai` — that's a primitive, not a UI choice.)
+- **NEVER instantiate language models directly.** All `LanguageModel` instances must come from `mastraFor(user).getLanguageModel()` or, inside a Mastra agent's model resolver, `resolveLanguageModel(llm)` from `@/mastra/lib/resolve-language-model`. Direct value imports of `anthropic()`, `openai()`, `gateway()`, etc. from `@ai-sdk/*` are a security smell — they invariably lead to `process.env` mutation for API keys, which breaks per-request isolation under concurrent user sessions and can leak keys across tenants. Type-only imports (`type LanguageModel`) remain allowed.
+- **NEVER assign API keys into `process.env`.** No `process.env.ANTHROPIC_API_KEY = ...`, `process.env.OPENAI_API_KEY = ...`, `process.env.AI_GATEWAY_API_KEY = ...`, or `process.env.OPENAI_BASE_URL = ...` anywhere in `src/`. The provider factories accept `apiKey` as a constructor argument — use that path. CI must grep for and reject these assignments.
+- **Don't bypass `withAuthenticatedRoute`.** Every authenticated route under `src/app/api/` must use the boundary helper from `@/app/api/_lib`. Direct calls to `getCurrentUser()` or `mastraFor()` from inside a route handler are a code smell. The only exceptions are unauthenticated webhooks and the onboarding bootstrap routes (which run before the user has a profile).

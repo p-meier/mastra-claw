@@ -1,26 +1,28 @@
 'use client';
 
-import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport } from 'ai';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  AssistantRuntimeProvider,
+  ComposerPrimitive,
+  MessagePrimitive,
+  ThreadPrimitive,
+  useAssistantRuntime,
+  useMessage,
+  useThread,
+} from '@assistant-ui/react';
+import {
+  AssistantChatTransport,
+  useChatRuntime,
+} from '@assistant-ui/react-ai-sdk';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { useRouter } from 'next/navigation';
 
-import {
-  Conversation,
-  ConversationContent,
-  ConversationScrollButton,
-} from '@/components/ai-elements/conversation';
-import {
-  Message,
-  MessageContent,
-  MessageResponse,
-} from '@/components/ai-elements/message';
-import {
-  PromptInput,
-  type PromptInputMessage,
-  PromptInputSubmit,
-  PromptInputTextarea,
-} from '@/components/ai-elements/prompt-input';
+import { MarkdownText } from '@/components/assistant-ui/markdown-text';
 import { BackButton } from '@/components/wizard/back-button';
 import { InfoBox, StepShell } from '@/components/wizard/step-shell';
 import { Mascot, type MascotAccessory } from '@/components/wizard/mascot';
@@ -279,81 +281,167 @@ type BootstrapStageProps = {
   onBack: () => void;
 };
 
+type WizardDraftWire = {
+  tone: Tone;
+  telegramSkipped: boolean;
+  telegramUserId: string | null;
+};
+
+/**
+ * Set up the assistant-ui runtime once for this stage and provide it to
+ * the inner shell. We deliberately split the runtime creation from the
+ * shell so the shell can call `useAssistantRuntime()` / `useThread()`
+ * inside the provider — those hooks throw outside an
+ * `AssistantRuntimeProvider`.
+ *
+ * Pattern (and rationale) mirrors `src/components/agent/agent-chat.tsx`,
+ * which is the canonical Mastra-agent chat surface. Same library, same
+ * primitives — onboarding is just a `streamText` route instead of a
+ * Mastra agent, but the wire format is the same AI SDK v6 UI message
+ * stream so `AssistantChatTransport` works against it unchanged.
+ */
 function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
   const router = useRouter();
   const [completed, setCompleted] = useState(false);
   const [commitError, setCommitError] = useState<string | null>(null);
   const [isFinishing, setIsFinishing] = useState(false);
 
-  const wizardDraft = {
-    tone: draft.tone,
-    telegramSkipped: draft.telegramSkipped,
-    telegramUserId: draft.telegramSkipped
-      ? null
-      : (draft.telegramUserId || null),
-  };
-
-  const { messages, sendMessage, status, error } = useChat({
-    transport: new DefaultChatTransport({
-      api: '/api/onboarding/bootstrap',
-      body: { wizardDraft },
+  // Memoize so the transport instance survives re-renders. The wizard
+  // draft never changes inside the bootstrap stage (the user already
+  // committed those steps before landing here), so we can safely depend
+  // on its primitive fields.
+  const wizardDraft = useMemo<WizardDraftWire>(
+    () => ({
+      tone: draft.tone,
+      telegramSkipped: draft.telegramSkipped,
+      telegramUserId: draft.telegramSkipped
+        ? null
+        : draft.telegramUserId || null,
     }),
-    onFinish: ({ message }) => {
-      // Look for the complete_bootstrap tool result. We need to check
-      // BOTH that the tool was called AND that its output reported
-      // ok=true — earlier we triggered success on call alone, which
-      // hid commit failures behind a green "All set!" message.
-      const parts = (message as {
-        parts?: Array<{
-          type?: string;
-          state?: string;
-          output?: { ok?: boolean; error?: string };
-        }>;
-      }).parts;
-      const completePart = parts?.find(
-        (p) =>
-          p.type === 'tool-complete_bootstrap' ||
-          (p as { toolName?: string }).toolName === 'complete_bootstrap',
-      );
-      if (!completePart) return;
+    [draft.tone, draft.telegramSkipped, draft.telegramUserId],
+  );
 
-      // The tool ran. Check the result.
-      const output = completePart.output;
-      if (output?.ok === true) {
-        setCompleted(true);
-        setTimeout(() => router.push('/'), 2000);
-      } else if (output?.ok === false) {
-        setCommitError(output.error ?? 'Failed to save your assistant.');
-      }
-      // If output is undefined the tool is still streaming — wait for the
-      // next onFinish callback.
-    },
-  });
+  const transport = useMemo(
+    () =>
+      new AssistantChatTransport({
+        api: '/api/onboarding/bootstrap',
+        body: { wizardDraft },
+      }),
+    [wizardDraft],
+  );
 
-  // Send a hidden kickoff so the assistant introduces itself first
+  const runtime = useChatRuntime({ transport });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <BootstrapShell
+        onBack={onBack}
+        completed={completed}
+        setCompleted={setCompleted}
+        commitError={commitError}
+        setCommitError={setCommitError}
+        isFinishing={isFinishing}
+        setIsFinishing={setIsFinishing}
+        wizardDraft={wizardDraft}
+        router={router}
+      />
+    </AssistantRuntimeProvider>
+  );
+}
+
+type BootstrapShellProps = {
+  onBack: () => void;
+  completed: boolean;
+  setCompleted: (v: boolean) => void;
+  commitError: string | null;
+  setCommitError: (v: string | null) => void;
+  isFinishing: boolean;
+  setIsFinishing: (v: boolean) => void;
+  wizardDraft: WizardDraftWire;
+  router: ReturnType<typeof useRouter>;
+};
+
+function BootstrapShell({
+  onBack,
+  completed,
+  setCompleted,
+  commitError,
+  setCommitError,
+  isFinishing,
+  setIsFinishing,
+  wizardDraft,
+  router,
+}: BootstrapShellProps) {
+  const runtime = useAssistantRuntime();
+  // `useThread` keeps this component reactive to thread state changes
+  // (running/idle), so the header mascot + thinking overlay update on
+  // every stream tick without us having to subscribe by hand.
+  const isRunning = useThread((t) => t.isRunning);
+  const isThinking = isRunning || isFinishing;
+
+  // Send a hidden kickoff so the assistant introduces itself first.
+  // `runtime.thread.append({...})` posts a user message and starts a
+  // run; the empty thread becomes a real conversation immediately.
   const initSentRef = useRef(false);
   useEffect(() => {
     if (initSentRef.current) return;
     initSentRef.current = true;
-    sendMessage({ text: '(begin)' });
-  }, [sendMessage]);
+    runtime.thread.append({
+      role: 'user',
+      content: [{ type: 'text', text: '(begin)' }],
+    });
+  }, [runtime]);
 
-  const handlePromptSubmit = (message: PromptInputMessage) => {
-    if (!message.text?.trim() || status === 'streaming' || completed) return;
-    sendMessage({ text: message.text });
-  };
+  // Watch for the `complete_bootstrap` tool result. The runtime fires
+  // `subscribe` on every state change; we walk the latest assistant
+  // message and look at its tool-call parts. Same semantics as the old
+  // `onFinish` callback, just expressed via the runtime's reactive API.
+  // We need BOTH that the tool was called AND that the result reported
+  // ok=true — earlier (in the useChat era) we triggered success on call
+  // alone, which hid commit failures behind a green "All set!" message.
+  useEffect(() => {
+    return runtime.thread.subscribe(() => {
+      if (completed) return;
+      const messages = runtime.thread.getState().messages;
+      // Walk back from the end — the tool we care about will be in the
+      // most recent assistant message.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg.role !== 'assistant') continue;
+        const toolPart = msg.content.find(
+          (p) => p.type === 'tool-call' && p.toolName === 'complete_bootstrap',
+        );
+        if (!toolPart || toolPart.type !== 'tool-call') break;
+        const result = toolPart.result as
+          | { ok?: boolean; error?: string }
+          | undefined;
+        if (result === undefined) break; // still streaming — wait
+        if (result.ok === true) {
+          setCompleted(true);
+          setTimeout(() => router.push('/'), 2000);
+        } else if (result.ok === false) {
+          setCommitError(result.error ?? 'Failed to save your assistant.');
+        }
+        break;
+      }
+    });
+  }, [runtime, completed, router, setCompleted, setCommitError]);
 
   /**
    * Force-finish path — bypasses the chat tool entirely. Posts the full
    * conversation history to /api/onboarding/bootstrap/finalize, which
    * runs generateObject() against the persona schema and commits
    * deterministically. Use when the model is dragging on or stuck.
+   *
+   * The /finalize route accepts AI SDK UIMessage shape; assistant-ui's
+   * AI SDK runtime exports the same shape via `exportExternalState()`.
    */
   const handleFinishNow = async () => {
     if (isFinishing || completed) return;
     setIsFinishing(true);
     setCommitError(null);
     try {
+      const messages = runtime.thread.exportExternalState();
       const res = await fetch('/api/onboarding/bootstrap/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -375,24 +463,13 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
     }
   };
 
-  // Drop the hidden "(begin)" kickoff from the rendered list
-  const visibleMessages = messages.filter(
-    (m, i) => !(i === 0 && m.role === 'user'),
-  );
-
-  const isThinking =
-    status === 'streaming' || status === 'submitted' || isFinishing;
-
   return (
-    // The whole sub-view is a fixed-height (svh) flex column. The header
-    // and footer are auto-sized; the Conversation in the middle takes
-    // flex-1 and provides its own internal scroll. The page itself never
-    // scrolls horizontally — overflow-x-hidden enforces that even if a
-    // child accidentally overflows on a narrow viewport.
+    // Fixed-height (svh) flex column: header + thread (flex-1, internal
+    // scroll) + composer footer. The page itself never scrolls
+    // horizontally — overflow-x-hidden enforces that.
     //
-    // The `dark` class scopes the shadcn theme variables (used by the
-    // ai-elements components — Conversation, Message, PromptInput) to
-    // dark mode for this view, so MessageResponse renders in white text
+    // The `dark` class scopes the shadcn theme variables to dark mode
+    // for this view so the assistant-ui primitives render in white text
     // on the dark background instead of falling back to the light
     // theme's near-black foreground.
     <div className="dark relative isolate flex h-svh min-h-0 flex-col overflow-x-hidden bg-[#08080b] text-white">
@@ -413,7 +490,7 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="size-10 shrink-0">
             <Mascot
-              variant={status === 'streaming' ? 'thinking' : 'idle'}
+              variant={isRunning ? 'thinking' : 'idle'}
               label={null}
               className="!gap-0 [&>div]:!size-10"
             />
@@ -443,35 +520,25 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
         )}
       </header>
 
-      {/* Scrollable conversation — the only thing that scrolls. */}
-      <Conversation className="relative z-10 min-h-0 flex-1">
-        <ConversationContent className="mx-auto w-full max-w-2xl gap-4 px-4 py-4 sm:gap-6 sm:px-6 sm:py-6">
-          {visibleMessages.map((m) => (
-            <Message from={m.role} key={m.id}>
-              <MessageContent className="break-words [overflow-wrap:anywhere]">
-                {m.parts.map((part, i) => {
-                  if (part.type === 'text') {
-                    return (
-                      <MessageResponse key={`${m.id}-${i}`}>
-                        {part.text}
-                      </MessageResponse>
-                    );
-                  }
-                  return null;
-                })}
-              </MessageContent>
-            </Message>
-          ))}
-          {error && <ErrorBox message={error.message} />}
-          {commitError && <ErrorBox message={commitError} />}
-          {completed && (
-            <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-center text-sm text-emerald-200">
-              All set! Taking you to your dashboard…
-            </div>
-          )}
-        </ConversationContent>
-        <ConversationScrollButton />
-      </Conversation>
+      {/* Scrollable thread — the only thing that scrolls. */}
+      <ThreadPrimitive.Root className="relative z-10 flex min-h-0 flex-1 flex-col">
+        <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto">
+          <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 px-4 py-4 sm:gap-6 sm:px-6 sm:py-6">
+            <ThreadPrimitive.Messages
+              components={{
+                UserMessage: BootstrapUserMessage,
+                AssistantMessage: BootstrapAssistantMessage,
+              }}
+            />
+            {commitError && <ErrorBox message={commitError} />}
+            {completed && (
+              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-center text-sm text-emerald-200">
+                All set! Taking you to your dashboard…
+              </div>
+            )}
+          </div>
+        </ThreadPrimitive.Viewport>
+      </ThreadPrimitive.Root>
 
       {/* Sticky input — never moves. While the assistant is thinking, an
           overlay covers the input with a 3-dot animation so the user
@@ -479,22 +546,38 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
           clear "the model is responding" indicator. */}
       <footer className="relative z-10 shrink-0 border-t border-white/[0.06] bg-[#08080b]/80 px-4 py-3 backdrop-blur-xl sm:px-6 sm:py-4">
         <div className="relative mx-auto w-full max-w-2xl">
-          <PromptInput onSubmit={handlePromptSubmit} className="w-full">
-            <PromptInputTextarea
+          <ComposerPrimitive.Root className="flex w-full items-end gap-2 rounded-lg border border-white/[0.08] bg-white/[0.04] p-2 focus-within:border-amber-400/50 focus-within:bg-white/[0.06] focus-within:ring-4 focus-within:ring-amber-400/15">
+            <ComposerPrimitive.Input
+              rows={1}
+              autoFocus
               placeholder={completed ? 'Done!' : 'Type a reply…'}
-              disabled={isThinking || completed}
-            />
-            <PromptInputSubmit
-              status={
-                status === 'streaming'
-                  ? 'streaming'
-                  : status === 'submitted'
-                    ? 'submitted'
-                    : 'ready'
-              }
               disabled={completed}
+              className="flex-1 resize-none bg-transparent px-2 py-2 text-sm text-white/90 placeholder:text-white/25 outline-none disabled:opacity-50"
             />
-          </PromptInput>
+            <ThreadPrimitive.If running={false}>
+              <ComposerPrimitive.Send asChild>
+                <button
+                  type="submit"
+                  disabled={completed}
+                  className="inline-flex size-9 items-center justify-center rounded-md bg-amber-500 text-sm font-semibold text-black transition-colors hover:bg-amber-400 disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <span aria-hidden>↑</span>
+                  <span className="sr-only">Send</span>
+                </button>
+              </ComposerPrimitive.Send>
+            </ThreadPrimitive.If>
+            <ThreadPrimitive.If running>
+              <ComposerPrimitive.Cancel asChild>
+                <button
+                  type="button"
+                  className="inline-flex size-9 items-center justify-center rounded-md border border-white/[0.10] bg-white/[0.04] text-white/70 transition-colors hover:bg-white/[0.08]"
+                >
+                  <span aria-hidden>■</span>
+                  <span className="sr-only">Stop</span>
+                </button>
+              </ComposerPrimitive.Cancel>
+            </ThreadPrimitive.If>
+          </ComposerPrimitive.Root>
           {isThinking && !completed && (
             <div
               className="pointer-events-none absolute inset-0 flex items-center justify-start rounded-lg bg-[#08080b]/70 pl-5 backdrop-blur-[2px]"
@@ -509,6 +592,51 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
         </div>
       </footer>
     </div>
+  );
+}
+
+/**
+ * Custom user message component for the bootstrap thread. Hides the
+ * very first user message (the hidden "(begin)" kickoff) so the user
+ * sees the assistant's intro as the first thing in the thread, not
+ * their own invisible nudge.
+ *
+ * `useMessage` is reactive — `index` and `role` come straight from the
+ * MessageState that the runtime provides per message slot.
+ */
+function BootstrapUserMessage() {
+  const isHiddenKickoff = useMessage((m) => {
+    if (m.index !== 0 || m.role !== 'user') return false;
+    const text = m.content
+      .map((p) => (p.type === 'text' ? p.text : ''))
+      .join('')
+      .trim();
+    return text === '(begin)';
+  });
+  if (isHiddenKickoff) return null;
+  return (
+    <MessagePrimitive.Root className="flex justify-end">
+      <div className="max-w-[80%] break-words rounded-2xl bg-amber-500/[0.12] px-4 py-2 text-sm text-amber-50 [overflow-wrap:anywhere]">
+        <MessagePrimitive.Parts />
+      </div>
+    </MessagePrimitive.Root>
+  );
+}
+
+/**
+ * Custom assistant message component for the bootstrap thread. Renders
+ * text parts via the shared `MarkdownText` (streamdown + Shiki +
+ * Mermaid), same as the per-agent chat surface.
+ */
+function BootstrapAssistantMessage() {
+  return (
+    <MessagePrimitive.Root className="flex justify-start">
+      <div className="max-w-[85%] break-words rounded-2xl bg-white/[0.04] px-4 py-2 text-sm text-white/90 [overflow-wrap:anywhere]">
+        <MessagePrimitive.Parts>
+          {({ part }) => (part.type === 'text' ? <MarkdownText /> : null)}
+        </MessagePrimitive.Parts>
+      </div>
+    </MessagePrimitive.Root>
   );
 }
 
