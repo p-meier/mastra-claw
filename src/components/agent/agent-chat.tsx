@@ -1,5 +1,9 @@
 'use client';
 
+import type {
+  ToolCallMessagePartComponent,
+  EmptyMessagePartComponent,
+} from '@assistant-ui/react';
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -11,7 +15,15 @@ import {
   useChatRuntime,
 } from '@assistant-ui/react-ai-sdk';
 import type { UIMessage } from 'ai';
-import { ArrowUpIcon, SquareIcon } from 'lucide-react';
+import {
+  ArrowUpIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  Loader2Icon,
+  SquareIcon,
+  TriangleAlertIcon,
+  WrenchIcon,
+} from 'lucide-react';
 import { useMemo } from 'react';
 
 import { MarkdownText } from '@/components/assistant-ui/markdown-text';
@@ -123,25 +135,157 @@ function UserMessage() {
 
 function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="flex justify-start">
-      <div className="bg-muted max-w-[80%] rounded-2xl px-4 py-2 text-sm">
-        {/*
-         * Render-prop form documented at
-         * https://www.assistant-ui.com/docs/ui/streamdown — text parts
-         * go through `MarkdownText` at
-         * `src/components/assistant-ui/markdown-text.tsx`, which is
-         * backed by `@assistant-ui/react-streamdown` (Shiki code
-         * highlighting + Mermaid diagrams) and tolerates partial
-         * markdown mid-stream.
-         */}
-        <MessagePrimitive.Parts>
-          {({ part }) =>
-            part.type === 'text' ? <MarkdownText /> : null
-          }
-        </MessagePrimitive.Parts>
-      </div>
+    <MessagePrimitive.Root className="flex w-full flex-col items-start gap-2">
+      {/*
+       * Components form of `MessagePrimitive.Parts` (vs. the previous
+       * render-prop form) so we can render every part type the agent
+       * emits — not just text. The render-prop form silently dropped
+       * tool-call and empty parts, which is why workspace tool calls
+       * and "thinking" state were invisible to the user.
+       *
+       * - `Text`           streams Markdown via `MarkdownText`
+       *                    (`@assistant-ui/react-streamdown` backend)
+       * - `tools.Fallback` shows every tool call (workspace file ops,
+       *                    future MCP tools, …) with status, args, and
+       *                    result in a collapsible card.
+       * - `Empty`          rendered when the assistant message has no
+       *                    parts yet OR the last part is non-text
+       *                    (default `unstable_showEmptyOnNonTextEnd`).
+       *                    This is the natural slot for the "Working…"
+       *                    indicator: it appears the moment the user
+       *                    sends a message and stays visible while a
+       *                    tool call is running, then disappears as
+       *                    soon as text starts streaming.
+       */}
+      <MessagePrimitive.Parts
+        components={{
+          Text: AssistantTextBubble,
+          Empty: AssistantEmptyIndicator,
+          tools: { Fallback: ToolFallback },
+        }}
+      />
     </MessagePrimitive.Root>
   );
+}
+
+function AssistantTextBubble() {
+  return (
+    <div className="bg-muted max-w-[80%] rounded-2xl px-4 py-2 text-sm">
+      <MarkdownText />
+    </div>
+  );
+}
+
+const AssistantEmptyIndicator: EmptyMessagePartComponent = ({ status }) => {
+  // `running` is the loading state — the agent has been invoked but
+  // hasn't streamed any text yet (or just finished a tool call and is
+  // about to stream the next chunk). Anything else is a terminal state
+  // we don't want to flash a spinner over, so we render nothing.
+  if (status.type !== 'running') return null;
+  return (
+    <div className="text-muted-foreground bg-muted/60 inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs">
+      <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+      <span>Working…</span>
+    </div>
+  );
+};
+
+/**
+ * Generic tool-call card. Renders for every tool the agent invokes
+ * unless a more specific `tools.by_name` entry takes over.
+ *
+ * Surfaces:
+ * - Humanized tool name (strip the `mastra_workspace_` prefix so
+ *   `mastra_workspace_write_file` becomes `Workspace · write file`).
+ * - Live status (running spinner / success check / error triangle /
+ *   "needs approval" pill when Mastra suspends the call).
+ * - Collapsible args (raw JSON, monospaced).
+ * - Collapsible result, if present.
+ *
+ * Implemented with `<details>`/`<summary>` so we don't pull in another
+ * disclosure dependency or wrestle with controlled state.
+ */
+const ToolFallback: ToolCallMessagePartComponent = ({
+  toolName,
+  args,
+  result,
+  isError,
+  status,
+}) => {
+  const label = humanizeToolName(toolName);
+
+  let StatusIcon = Loader2Icon;
+  let statusClass = 'animate-spin text-muted-foreground';
+  let statusText = 'Running';
+  if (status.type === 'requires-action') {
+    StatusIcon = WrenchIcon;
+    statusClass = 'text-amber-600';
+    statusText = 'Needs approval';
+  } else if (status.type === 'incomplete' || isError) {
+    StatusIcon = TriangleAlertIcon;
+    statusClass = 'text-destructive';
+    statusText = 'Failed';
+  } else if (status.type === 'complete') {
+    StatusIcon = CheckIcon;
+    statusClass = 'text-emerald-600';
+    statusText = 'Done';
+  }
+
+  return (
+    <details className="bg-muted/40 group max-w-[80%] rounded-xl border text-xs">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2">
+        <StatusIcon className={cn('size-3.5 shrink-0', statusClass)} aria-hidden />
+        <span className="text-foreground font-medium">{label}</span>
+        <span className="text-muted-foreground ml-auto inline-flex items-center gap-1">
+          {statusText}
+          <ChevronDownIcon
+            className="size-3.5 transition-transform group-open:rotate-180"
+            aria-hidden
+          />
+        </span>
+      </summary>
+      <div className="space-y-2 border-t px-3 py-2">
+        {args !== undefined && (
+          <ToolJsonBlock label="Arguments" value={args} />
+        )}
+        {result !== undefined && (
+          <ToolJsonBlock label="Result" value={result} />
+        )}
+      </div>
+    </details>
+  );
+};
+
+function ToolJsonBlock({ label, value }: { label: string; value: unknown }) {
+  let body: string;
+  try {
+    body = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  } catch {
+    body = String(value);
+  }
+  return (
+    <div>
+      <div className="text-muted-foreground mb-1 text-[10px] font-medium tracking-wide uppercase">
+        {label}
+      </div>
+      <pre className="bg-background/60 max-h-64 overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap">
+        {body}
+      </pre>
+    </div>
+  );
+}
+
+function humanizeToolName(toolName: string): string {
+  // Mastra's built-in workspace tools are namespaced as
+  // `mastra_workspace_<verb>` (see `WORKSPACE_TOOLS` in
+  // `@mastra/core/workspace`). Strip the prefix and present them as
+  // "Workspace · <verb>". Other tools fall back to a slug-to-words
+  // conversion.
+  if (toolName.startsWith('mastra_workspace_')) {
+    const verb = toolName.slice('mastra_workspace_'.length).replace(/_/g, ' ');
+    return `Workspace · ${verb}`;
+  }
+  return toolName.replace(/[_-]+/g, ' ');
 }
 
 function Composer() {

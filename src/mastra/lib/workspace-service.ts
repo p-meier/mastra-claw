@@ -3,7 +3,16 @@ import 'server-only';
 import * as path from 'node:path';
 
 import type { CurrentUser } from '@/lib/auth';
-import { getWorkspaceFilesystem } from '@/mastra/workspace';
+import {
+  getWorkspaceFilesystem,
+  WorkspaceNotConfiguredError,
+  WorkspacePathError,
+} from '@/mastra/workspace';
+
+// Re-exported for call-site stability — the canonical definitions live
+// in `@/mastra/workspace` so the lower-level `createUserAgentWorkspace`
+// builder can throw the same types without a circular import.
+export { WorkspaceNotConfiguredError, WorkspacePathError };
 
 /**
  * Per-tenant workspace helpers wrapping the shared S3 filesystem.
@@ -20,20 +29,6 @@ import { getWorkspaceFilesystem } from '@/mastra/workspace';
  * enforces per-user isolation at the storage RLS layer, so a bug here
  * still cannot leak data across tenants.
  */
-
-export class WorkspaceNotConfiguredError extends Error {
-  constructor() {
-    super('Workspace storage is not configured (Supabase S3 env vars missing)');
-    this.name = 'WorkspaceNotConfiguredError';
-  }
-}
-
-export class WorkspacePathError extends Error {
-  constructor(message: string) {
-    super(`Workspace path rejected: ${message}`);
-    this.name = 'WorkspacePathError';
-  }
-}
 
 export type WorkspaceEntry = {
   name: string;

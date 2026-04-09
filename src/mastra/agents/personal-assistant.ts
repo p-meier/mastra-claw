@@ -11,6 +11,7 @@ import {
   withUserContext,
 } from '../lib/user-context';
 import { storage } from '../storage';
+import { createUserAgentWorkspace } from '../workspace';
 
 /**
  * Personal Assistant — the user-facing Main Agent.
@@ -45,7 +46,9 @@ Default behavior:
 - Never take destructive action (sending email, modifying calendars, posting publicly, spending money) without explicit confirmation. Surface a clear summary and wait.
 - When you don't know, say so and propose how to find out.
 - Prefer doing one thing well over hedging across three.
-- Match the user's tone and energy. Don't over-explain.`;
+- Match the user's tone and energy. Don't over-explain.
+
+You have a private file workspace that persists across conversations for this specific user. Use it as your scratchpad: save artifacts the user asks you to keep (notes, drafts, generated documents), and read them back later when relevant. The user does not see the workspace contents unless they open the file browser or you tell them what's there. Writes, edits, and deletes require explicit user approval — surface the file path and a short summary of what you're about to do, then wait.`;
 
 export const personalAssistant = new Agent({
   id: 'personal-assistant',
@@ -112,6 +115,25 @@ export const personalAssistant = new Agent({
       generateTitle: true,
     },
   }),
+
+  // Per-user S3-backed workspace, resolved per request from the
+  // `userId` key that `applyUserContext()` writes onto every request
+  // context (`src/mastra/lib/user-context.ts`). The builder returns a
+  // fresh `Workspace` whose `S3Filesystem` is pinned to the
+  // `users/<userId>/agents/personal-assistant/` prefix — Mastra
+  // auto-wires `mastra_workspace_read_file`, `_write_file`,
+  // `_list_files`, `_grep`, etc. into the agent's toolset, all routed
+  // through that prefix.
+  //
+  // Forgiving on missing context (Studio invocations without auth):
+  // returning `undefined` makes Mastra fall back to no workspace
+  // tools instead of crashing the call.
+  workspace: async ({ requestContext }) => {
+    if (!requestContext) return undefined;
+    const userId = requestContext.get('userId') as string | undefined;
+    if (!userId) return undefined;
+    return createUserAgentWorkspace(userId, 'personal-assistant') ?? undefined;
+  },
 
   // Channels — text-only for Phase 1. Telegram runs in polling mode
   // so the embedded Mastra-in-Next.js process pulls updates from
