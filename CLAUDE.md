@@ -116,17 +116,6 @@ The hybrid pattern solves the compound error problem (95% per-step accuracy degr
 
 - **Disposable infrastructure.** The compute container holds no persistent state. Killing it and recreating it is a no-op. All state is in Supabase. Backup = `pg_dump` + `aws s3 sync`. Restore = new project + `psql < dump.sql`.
 
-## Mastra Studio
-
-Mastra Studio is the built-in development UI available at `http://localhost:4111` during `npm run dev`. It provides:
-- **Agent Testing** — Interactive chat with agents, inspect tool calls, view memory state
-- **Workflow Debugging** — Step-by-step execution visualization, inspect inputs/outputs per step, retry failed steps
-- **Tool Management** — Test tools in isolation, view execution logs
-- **Trace Viewer** — Full observability into agent reasoning chains, latencies, and token usage
-- **Memory Inspector** — View and manage threads, working memory, and semantic recall entries
-
-Studio is the primary development and debugging surface — use it before deploying to production.
-
 ## Memory Architecture
 
 Mastra provides a comprehensive 4-tier memory system, managed via processors:
@@ -406,7 +395,6 @@ npx supabase db push     # runs SQL migrations into the local Postgres
 
 # Development
 npm run dev              # Next.js dev server (Mastra is embedded, not a separate process)
-npm run dev:studio       # Mastra Studio (separate dev process, same DB) at http://localhost:4111
 
 # Local Supabase lifecycle
 npx supabase status      # show URLs / keys / health
