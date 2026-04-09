@@ -71,7 +71,6 @@ const nav = {
    */
   navAdmin: [
     { title: "Admin Settings", url: "/admin/settings", icon: Settings2Icon },
-    { title: "Setup Wizard", url: "/admin/setup", icon: ShieldCheckIcon },
   ],
 } as const
 

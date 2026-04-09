@@ -1,5 +1,6 @@
 import Link from 'next/link';
 
+import { SidebarInset, SidebarTrigger } from '@/components/ui/sidebar';
 import { requireAdmin } from '@/lib/auth';
 import { DEFAULTS } from '@/lib/defaults';
 import { readOverride, resolveSettings } from '@/lib/settings/resolve';
@@ -45,20 +46,25 @@ export default async function AdminSettingsPage() {
   ]);
 
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 px-6 py-10">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">Admin Settings</h1>
-        <p className="text-muted-foreground mt-1 text-sm">
-          Override the deployment defaults shipped in{' '}
-          <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">
-            src/lib/defaults.ts
-          </code>
-          . Changes take effect immediately for every user — no redeploy
-          required.
-        </p>
+    <SidebarInset>
+      <header className="bg-background sticky top-0 z-10 flex h-16 shrink-0 items-center gap-3 border-b px-6">
+        <SidebarTrigger className="-ml-2" />
+        <div className="ml-2 flex min-w-0 flex-1 flex-col">
+          <h1 className="truncate text-sm font-semibold leading-none">
+            Admin Settings
+          </h1>
+          <span className="text-muted-foreground truncate text-xs">
+            Override the deployment defaults shipped in{' '}
+            <code className="bg-muted rounded px-1 py-0.5 font-mono text-[10px]">
+              src/lib/defaults.ts
+            </code>
+            . Changes apply immediately, no redeploy required.
+          </span>
+        </div>
       </header>
 
-      <section>
+      <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 p-6">
+        <section>
         <h2 className="mb-2 text-base font-semibold">Language model</h2>
         <p className="text-muted-foreground mb-4 text-sm">
           Provider, default model, and custom base URL. These are managed
@@ -133,7 +139,8 @@ export default async function AdminSettingsPage() {
             />
           </div>
         </div>
-      </section>
-    </main>
+        </section>
+      </div>
+    </SidebarInset>
   );
 }

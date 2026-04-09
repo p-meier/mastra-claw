@@ -37,8 +37,8 @@ import { applyUserContext } from './user-context';
 // (`src/mastra/lib/user-context.ts`) — agents extend
 // `userContextSchema` with their own keys, so this helper plugs into
 // any of them without forcing a generic at the call site.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function loadChannelContextOnto(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   rc: RequestContext<any>,
 ): Promise<void> {
   // Idempotent: if applyUserContext already ran for this request, bail.

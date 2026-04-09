@@ -29,7 +29,7 @@ export default async function AccountSettingsPage() {
 
   return (
     <SidebarInset>
-      <header className="flex h-16 shrink-0 items-center gap-3 px-4 sm:px-6">
+      <header className="bg-background sticky top-0 z-10 flex h-16 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
         <SidebarTrigger className="-ml-2" />
         <div className="ml-2 flex min-w-0 flex-1 items-center justify-between gap-2">
           <div className="flex min-w-0 flex-col">
