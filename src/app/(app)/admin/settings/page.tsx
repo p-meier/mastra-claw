@@ -1,146 +1,157 @@
-import Link from 'next/link';
-
+import { ProviderCategorySection } from '@/components/providers/provider-category-section';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { SidebarInset, SidebarTrigger } from '@/components/ui/sidebar';
 import { requireAdmin } from '@/lib/auth';
-import { DEFAULTS } from '@/lib/defaults';
-import { readOverride, resolveSettings } from '@/lib/settings/resolve';
-
-import { SettingsRow } from './_components/settings-row';
+import { serializeFields } from '@/lib/descriptors/serialize';
+import { getProviderSecretFieldStatus } from '@/lib/providers/actions';
+import {
+  PROVIDER_CATEGORIES,
+  type ProviderCategory,
+  categoryTitle,
+  getProvidersByCategory,
+} from '@/lib/providers/registry';
+import { resolveSettings } from '@/lib/settings/resolve';
 
 /**
- * Admin Settings page. Lets the admin override Tier 0 (`src/lib/defaults.ts`)
- * values from the UI without redeploying — writes go to the
- * `app_settings` table (Tier 1, RLS-gated to admins).
+ * Admin Settings page — the canonical edit surface for application
+ * provider configuration. Replaces the read-only badge view with a
+ * full descriptor-section per provider category.
  *
- * Layout:
- *   - LLM section: provider / model / base URL. These are wizard-managed
- *     (re-run /admin/setup to change them) and rendered read-only here.
- *   - Voice section: ElevenLabs voice ID and model ID. Editable inline,
- *     reset button falls back to Tier 0.
+ * Layout: full-width `SidebarInset` shell, identical to the user
+ * `account/settings` page. The four category sections stack vertically
+ * — Text, Image & Video, Text-to-Speech, Speech-to-Text. Each section
+ * lists the configured providers (with active badge + edit/delete
+ * affordances) and an "Add provider" picker for the unconfigured ones.
  *
- * The override resolver in `src/lib/settings/resolve.ts` is the single
- * source of truth for valid keys + per-key Zod validation.
+ * The runtime `Descriptor` objects contain server-only `probe`
+ * functions and cannot cross into client components, so the page
+ * shrinks each one into a serializable shape via `serializeFields()`
+ * before passing it to `<ProviderCategorySection>`.
  */
+
 export const metadata = {
   title: 'Admin Settings — MastraClaw',
 };
 
 export default async function AdminSettingsPage() {
-  await requireAdmin();
+  const currentUser = await requireAdmin();
   const settings = await resolveSettings();
 
-  // Read raw `app_settings` rows so we can render the "default" vs
-  // "overridden" badge. `null` means no row → falling back to Tier 0.
-  const [
-    llmProviderOverride,
-    llmModelOverride,
-    llmBaseUrlOverride,
-    voiceIdOverride,
-    voiceModelOverride,
-  ] = await Promise.all([
-    readOverride('llm.default_provider'),
-    readOverride('llm.default_text_model'),
-    readOverride('llm.custom_base_url'),
-    readOverride('elevenlabs.voice_id'),
-    readOverride('elevenlabs.model_id'),
-  ]);
+  const sections = await Promise.all(
+    PROVIDER_CATEGORIES.map((category) => buildCategoryProps(category, settings)),
+  );
 
   return (
     <SidebarInset>
-      <header className="bg-background sticky top-0 z-10 flex h-16 shrink-0 items-center gap-3 border-b px-6">
+      <header className="bg-background sticky top-0 z-10 flex h-16 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
         <SidebarTrigger className="-ml-2" />
-        <div className="ml-2 flex min-w-0 flex-1 flex-col">
-          <h1 className="truncate text-sm font-semibold leading-none">
-            Admin Settings
-          </h1>
-          <span className="text-muted-foreground truncate text-xs">
-            Override the deployment defaults shipped in{' '}
-            <code className="bg-muted rounded px-1 py-0.5 font-mono text-[10px]">
-              src/lib/defaults.ts
-            </code>
-            . Changes apply immediately, no redeploy required.
-          </span>
+        <div className="ml-2 flex min-w-0 flex-1 items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-col">
+            <h1 className="truncate text-sm font-semibold leading-none">
+              Admin Settings
+            </h1>
+            <span className="text-muted-foreground truncate text-xs">
+              {currentUser.email}
+            </span>
+          </div>
         </div>
       </header>
 
-      <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 p-6">
-        <section>
-        <h2 className="mb-2 text-base font-semibold">Language model</h2>
-        <p className="text-muted-foreground mb-4 text-sm">
-          Provider, default model, and custom base URL. These are managed
-          by the{' '}
-          <Link
-            href="/admin/setup"
-            className="underline underline-offset-2 hover:text-foreground"
-          >
-            setup wizard
-          </Link>{' '}
-          — re-run it to change them.
-        </p>
-        <div className="rounded-lg border">
-          <div className="px-4">
-            <SettingsRow
-              settingKey="llm.default_provider"
-              label="Default provider"
-              description="Which LLM provider every user runs against by default."
-              effectiveValue={settings.llm.provider}
-              defaultValue={DEFAULTS.llm.provider}
-              isOverridden={llmProviderOverride !== null}
-              readOnly
-            />
-            <SettingsRow
-              settingKey="llm.default_text_model"
-              label="Default text model"
-              description="Provider-prefixed model id, e.g. `anthropic/claude-sonnet-4-5`."
-              effectiveValue={settings.llm.defaultTextModel}
-              defaultValue={DEFAULTS.llm.defaultTextModel}
-              isOverridden={llmModelOverride !== null}
-              readOnly
-            />
-            <SettingsRow
-              settingKey="llm.custom_base_url"
-              label="Custom base URL"
-              description="Only used when the provider is set to `custom`."
-              effectiveValue={settings.llm.customBaseUrl ?? ''}
-              defaultValue={DEFAULTS.llm.customBaseUrl ?? ''}
-              isOverridden={llmBaseUrlOverride !== null}
-              readOnly
-            />
-          </div>
-        </div>
-      </section>
+      <div className="flex flex-1 flex-col gap-6 p-4 sm:p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>Application providers</CardTitle>
+            <CardDescription>
+              Each category supports multiple providers; one is active at a
+              time. Editing a provider runs a connection probe and only
+              persists if it succeeds. Switching the active provider does not
+              require re-entering credentials.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-8">
+            {sections.map((section) => (
+              <ProviderCategorySection key={section.category} {...section} />
+            ))}
+          </CardContent>
+        </Card>
 
-      <section>
-        <h2 className="mb-2 text-base font-semibold">Voice (ElevenLabs)</h2>
-        <p className="text-muted-foreground mb-4 text-sm">
-          Defaults ship in source. Override here if you want a different
-          voice without redeploying. The ElevenLabs API key itself lives
-          in Vault and is set via the setup wizard.
-        </p>
-        <div className="rounded-lg border">
-          <div className="px-4">
-            <SettingsRow
-              settingKey="elevenlabs.voice_id"
-              label="Voice ID"
-              description="ElevenLabs voice id used for TTS."
-              effectiveValue={settings.elevenlabs.voiceId}
-              defaultValue={DEFAULTS.elevenlabs.voiceId}
-              isOverridden={voiceIdOverride !== null}
-              placeholder={DEFAULTS.elevenlabs.voiceId}
-            />
-            <SettingsRow
-              settingKey="elevenlabs.model_id"
-              label="Model ID"
-              description="ElevenLabs TTS model, e.g. `eleven_v3`."
-              effectiveValue={settings.elevenlabs.modelId}
-              defaultValue={DEFAULTS.elevenlabs.modelId}
-              isOverridden={voiceModelOverride !== null}
-              placeholder={DEFAULTS.elevenlabs.modelId}
-            />
-          </div>
-        </div>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Composio</CardTitle>
+            <CardDescription>
+              {settings.composio.configured
+                ? 'Configured. Re-run the setup wizard to rotate the API key.'
+                : 'Not configured. Run the setup wizard to add a Composio API key for tool federation.'}
+            </CardDescription>
+          </CardHeader>
+        </Card>
       </div>
     </SidebarInset>
   );
+}
+
+async function buildCategoryProps(
+  category: ProviderCategory,
+  settings: Awaited<ReturnType<typeof resolveSettings>>,
+) {
+  const all = getProvidersByCategory(category);
+  const slot = settings.providers[categoryKey(category)];
+
+  // Each configured provider gets the full instance shape: serializable
+  // fields, current config, and the per-field "is the secret already
+  // stored in Vault" map for the edit form's stored-placeholder UI.
+  const configured = await Promise.all(
+    slot.configured.map(async (id) => {
+      const descriptor = all.find((p) => p.id === id);
+      if (!descriptor) return null;
+      return {
+        id,
+        displayName: descriptor.displayName,
+        blurb: descriptor.blurb,
+        isActive: slot.active?.id === id,
+        config: slot.active?.id === id ? (slot.active?.config ?? {}) : {},
+        secretFieldStatus: await getProviderSecretFieldStatus(category, id),
+        fields: serializeFields(descriptor.fields),
+      };
+    }),
+  );
+
+  const addable = all
+    .filter((p) => !slot.configured.includes(p.id))
+    .map((p) => ({
+      id: p.id,
+      displayName: p.displayName,
+      blurb: p.blurb,
+      fields: serializeFields(p.fields),
+    }));
+
+  return {
+    category,
+    title: categoryTitle(category),
+    description: descriptionFor(category),
+    configured: configured.filter((c): c is NonNullable<typeof c> => c !== null),
+    addable,
+  };
+}
+
+function categoryKey(c: ProviderCategory) {
+  switch (c) {
+    case 'text':
+      return 'text' as const;
+    case 'image-video':
+      return 'imageVideo' as const;
+    case 'voice':
+      return 'voice' as const;
+  }
+}
+
+function descriptionFor(category: ProviderCategory): string {
+  switch (category) {
+    case 'text':
+      return 'LLM provider used for chat, agent reasoning, and any other text generation.';
+    case 'image-video':
+      return 'Image and video generation. The Vercel AI Gateway covers both with a single key.';
+    case 'voice':
+      return 'Combined voice provider — Text-to-Speech for replies and Speech-to-Text for incoming voice messages, in one configuration.';
+  }
 }

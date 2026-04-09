@@ -1,60 +1,32 @@
 /**
  * Next.js instrumentation hook — runs once at server boot, before any
- * request hits a route handler. Used here for two things:
+ * request hits a route handler.
  *
- *  1. **Seed `TELEGRAM_BOT_TOKEN` into `process.env`** from the
- *     Supabase Vault `app:telegram_bot_token` secret. The Telegram
- *     adapter from `@chat-adapter/telegram` auto-detects this env
- *     var when no `botToken` is passed to `createTelegramAdapter()`.
- *     Per CLAUDE.md, app secrets live in Vault and never in
- *     `.env.local`; this hook is the bridge.
+ * Sole job after the channel-registry refactor: force `@/mastra` to
+ * construct so the Mastra instance comes up and `AgentChannels.initialize()`
+ * fires for every agent that has a non-empty `channels` slot. Without
+ * this hook, polling wouldn't kick off until the first HTTP request,
+ * which could be never on a quiet morning.
  *
- *  2. **Force `@/mastra` to construct.** Importing the module here
- *     runs the `Mastra` constructor, which in turn calls
- *     `AgentChannels.initialize()` for every agent that has a
- *     `channels` config — and that's what starts the Telegram polling
- *     loop. Without this hook, polling wouldn't kick off until the
- *     first HTTP request, which could be never on a quiet morning.
+ * The previous implementation also seeded `process.env.TELEGRAM_BOT_TOKEN`
+ * from Vault. That hack is gone — `buildAgentChannels()` now resolves
+ * each adapter's credentials inline through `channelSecrets.get(...)`,
+ * so no API key ever touches `process.env`.
  *
- * Failures here should NEVER crash the server: a missing bot token in
- * dev means the channels config will throw on first poll, but the rest
- * of the app (web chat, workspace, …) keeps working.
+ * Failures here should NEVER crash the server: a missing channel
+ * configuration in dev means the channel adapter is simply not built,
+ * but the rest of the app (web chat, workspace, …) keeps working.
  */
 export async function register(): Promise<void> {
   // Only run on the Node.js server runtime — not on the Edge runtime
-  // and not in the browser. The Vault read is server-only.
+  // and not in the browser.
   if (process.env.NEXT_RUNTIME !== 'nodejs') return;
 
   try {
-    const { createServiceClient } = await import('@/lib/supabase/service');
-    const { APP_SECRET_NAMES } = await import('@/mastra/lib/secret-service');
-
-    const supabase = createServiceClient();
-    const { data, error } = await supabase.rpc('app_secret_get', {
-      p_name: APP_SECRET_NAMES.telegramBotToken,
-    });
-
-    if (error) {
-      console.warn(
-        `[instrumentation] failed to read telegram bot token from Vault: ${error.message}`,
-      );
-    } else if (typeof data === 'string' && data.length > 0) {
-      process.env.TELEGRAM_BOT_TOKEN = data;
-    } else {
-      console.info(
-        '[instrumentation] no telegram bot token in Vault — Telegram channel disabled until admin setup is run',
-      );
-    }
-  } catch (err) {
-    console.warn(
-      '[instrumentation] failed to seed Telegram bot token:',
-      err instanceof Error ? (err.stack ?? err.message) : err,
-    );
-  }
-
-  // Force Mastra construction → triggers AgentChannels.initialize()
-  // for every agent with a `channels` config, which starts polling.
-  try {
+    // Importing `@/mastra` triggers the top-level `await
+    // createPersonalAssistant()` and the Mastra constructor, which in
+    // turn calls `AgentChannels.initialize()` for every channel
+    // returned by `buildAgentChannels()`.
     await import('@/mastra');
   } catch (err) {
     console.warn(

@@ -1,8 +1,10 @@
 import { redirect } from 'next/navigation';
 
-import { requireAdmin, AdminRequiredError } from '@/lib/auth';
-import { createClient } from '@/lib/supabase/server';
 import { StepShell } from '@/components/wizard/step-shell';
+import { AdminRequiredError, requireAdmin } from '@/lib/auth';
+import { serializeFields } from '@/lib/descriptors/serialize';
+import { getProvidersByCategory } from '@/lib/providers/registry';
+import { resolveSettings } from '@/lib/settings/resolve';
 
 import { AdminSetupWizard } from './_components/admin-setup-wizard';
 import { Handoff } from './_components/handoff';
@@ -12,19 +14,21 @@ export const metadata = {
 };
 
 /**
- * Admin Setup wizard shell.
+ * Admin Setup wizard shell — Server Component.
  *
- * Server Component that gates by admin role and decides between two
- * branches:
+ * Two branches, gated by `app.setup_completed_at`:
  *
- *   - app.setup_completed_at IS NULL → mount the wizard client component
- *     which holds all in-progress state and commits atomically at the end
- *   - already completed → render the handoff screen (Continue with personal
- *     setup vs. Skip — I'm just the administrator)
+ *   - not yet completed → mount the slimmed wizard, which walks the
+ *     admin through three provider categories and then calls
+ *     `finalizeAdminSetupAction()`.
  *
- * The proxy gate already redirects fully-onboarded users away from this
- * route, so reaching it post-handoff implies the admin came back via a
- * direct URL — in that case the redirect to / catches them.
+ *   - already completed → render the handoff screen (Continue with
+ *     personal setup vs. Skip).
+ *
+ * The provider descriptors live in `src/lib/providers/`. They contain
+ * server-only `probe` functions that cannot cross into the client
+ * component, so we serialize each one's fields here and pass the
+ * trimmed view down.
  */
 export default async function AdminSetupPage() {
   try {
@@ -36,22 +40,15 @@ export default async function AdminSetupPage() {
     throw err;
   }
 
-  const supabase = await createClient();
-  const { data: settings } = await supabase
-    .from('app_settings')
-    .select('value')
-    .eq('key', 'app.setup_completed_at')
-    .maybeSingle();
-
-  const setupCompleted =
-    settings?.value !== null && settings?.value !== undefined;
+  const settings = await resolveSettings();
+  const setupCompleted = settings.app.setupCompletedAt !== null;
 
   if (setupCompleted) {
     return (
       <StepShell
         mascotLabel="MastraClaw"
-        step={8}
-        totalSteps={8}
+        step={4}
+        totalSteps={4}
         question="You're all set"
         footer={null}
       >
@@ -60,5 +57,30 @@ export default async function AdminSetupPage() {
     );
   }
 
-  return <AdminSetupWizard />;
+  const textProviders = getProvidersByCategory('text').map(serializeProvider);
+  const imageVideoProviders = getProvidersByCategory('image-video').map(serializeProvider);
+  const voiceProviders = getProvidersByCategory('voice').map(serializeProvider);
+
+  return (
+    <AdminSetupWizard
+      textProviders={textProviders}
+      imageVideoProviders={imageVideoProviders}
+      voiceProviders={voiceProviders}
+      initialActive={{
+        text: settings.providers.text.active?.id ?? null,
+        imageVideo: settings.providers.imageVideo.active?.id ?? null,
+        voice: settings.providers.voice.active?.id ?? null,
+      }}
+    />
+  );
+}
+
+function serializeProvider(p: ReturnType<typeof getProvidersByCategory>[number]) {
+  return {
+    id: p.id,
+    displayName: p.displayName,
+    blurb: p.blurb,
+    badge: p.badge,
+    fields: serializeFields(p.fields),
+  };
 }

@@ -49,8 +49,6 @@ export default async function PersonalOnboardingPage() {
   }
 
   return (
-    <OnboardingWizard
-      telegramConfiguredOnInstance={settings.telegram.configured}
-    />
+    <OnboardingWizard />
   );
 }

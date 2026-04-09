@@ -1,7 +1,7 @@
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
-import { createTelegramAdapter } from '@chat-adapter/telegram';
 
+import { buildPersonalAssistantChannels } from '../lib/agent-channels';
 import { loadChannelContextOnto } from '../lib/channel-context-loader';
 import { AppNotConfiguredError } from '../lib/llm-credentials';
 import { resolveLanguageModel } from '../lib/resolve-language-model';
@@ -50,7 +50,26 @@ Default behavior:
 
 You have a private file workspace that persists across conversations for this specific user. Use it as your scratchpad: save artifacts the user asks you to keep (notes, drafts, generated documents), and read them back later when relevant. The user does not see the workspace contents unless they open the file browser or you tell them what's there. Writes, edits, and deletes require explicit user approval — surface the file path and a short summary of what you're about to do, then wait.`;
 
-export const personalAssistant = new Agent({
+/**
+ * Build the Personal Assistant agent.
+ *
+ * Why this is an async factory now: the `channels.adapters` map used to
+ * be hardcoded to a single Telegram adapter that auto-read its bot
+ * token from `process.env.TELEGRAM_BOT_TOKEN` (seeded by an
+ * `instrumentation.ts` Vault read). After the channel-registry refactor
+ * the channel set is dynamic — anything an admin has configured under
+ * `/admin/channels` ends up here — and credentials are passed inline to
+ * each adapter factory rather than going through `process.env`.
+ *
+ * The factory is called once at module load from `src/mastra/index.ts`
+ * via top-level await. Cold start is fine (one Vault round-trip per
+ * configured channel) and the result is captured as a singleton for
+ * the lifetime of the process.
+ */
+export async function createPersonalAssistant() {
+  const channels = await buildPersonalAssistantChannels();
+
+  return new Agent({
   id: 'personal-assistant',
   name: 'Personal Assistant',
   description:
@@ -135,14 +154,10 @@ export const personalAssistant = new Agent({
     return createUserAgentWorkspace(userId, 'personal-assistant') ?? undefined;
   },
 
-  // Channels — text-only for Phase 1. Telegram runs in polling mode
-  // so the embedded Mastra-in-Next.js process pulls updates from
-  // Telegram directly without exposing a public webhook URL.
-  // Voice (ElevenLabs STT/TTS) lands later via `voice` + an audio
-  // attachment branch in `handlers.onDirectMessage`.
-  channels: {
-    adapters: {
-      telegram: createTelegramAdapter({ mode: 'polling' }),
-    },
-  },
-});
+  // Channels are populated from the admin channel registry. Each
+  // adapter is constructed with explicit credentials (no
+  // `process.env` mutation). When no channel is configured the field
+  // is left undefined so Mastra skips channel initialization entirely.
+  channels,
+  });
+}

@@ -2,75 +2,96 @@ import 'server-only';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { cache } from 'react';
-import { z } from 'zod';
 
+import { listChannels } from '@/lib/channels/registry';
 import { DEFAULTS } from '@/lib/defaults';
+import {
+  PROVIDER_CATEGORIES,
+  type ProviderCategory,
+  getProvider,
+} from '@/lib/providers/registry';
 import { createClient } from '@/lib/supabase/server';
 
 /**
- * Tier 1 — `app_settings` resolver.
+ * Settings resolver.
  *
- * Reads every known key from `public.app_settings`, validates each
- * value against a Zod schema, and merges the result over the Tier 0
- * defaults from `src/lib/defaults.ts`. Returns a fully-defined object —
- * call sites never have to handle a `null` for fields that have a
- * default.
+ * Walks the `app_settings` table and assembles a fully-typed
+ * `ResolvedSettings` object that downstream code (the chat route, the
+ * channel context loader, the agent factory) can read without knowing
+ * about the underlying key/value layout.
+ *
+ * Schema (Tier 1 = `app_settings`):
+ *
+ *   app.setup_completed_at                            string ISO timestamp | null
+ *   providers.{category}.active                       providerId | null
+ *   providers.{category}.{providerId}.config          { ... non-secret fields ... }
+ *   channels.{channelId}.configured                   boolean
+ *   channels.{channelId}.config                       { ... non-secret fields, voiceEnabled }
+ *   composio.configured                               boolean
+ *
+ * The dynamic keys (`providers.*.config`, `channels.*.config`) are
+ * validated lazily by looking up the matching descriptor in the
+ * registry and asserting that every required non-secret field has a
+ * value. Unknown providers/channels (e.g. data left over from a
+ * deleted descriptor) are skipped with a console warning rather than
+ * crashing the chat route.
  *
  * Two entry points:
  *
  *  - `resolveSettings()` — cookie-bound Supabase client, cached per
- *    request via `react.cache`. The `app_settings` RLS policy is
- *    admin-only for writes; reads are also gated, but every server
- *    component / server action that calls this is already running in
- *    a context where the caller's role is established. The chat route
- *    needs read access for non-admin users, so the underlying RLS
- *    policy must allow it (see migration 20260408195437 — read access
- *    is implicit on `app_settings` for any authenticated user; only
- *    write is admin-gated).
+ *    request via `react.cache`.
  *
  *  - `resolveSettingsAsService(supabase)` — explicit service-role
- *    client, NOT cached. For headless entry points (Telegram webhook,
- *    cron, instrumentation) that have no cookies and no React lifecycle.
- *
- * Adding a new key? Touch this file (`settingValueSchema` + the
- * `merge()` mapping) and `src/lib/defaults.ts`. That's it — no new
- * SQL, no migration. The `app_settings` table is generic key/value.
+ *    client, NOT cached. For headless entry points (Telegram polling,
+ *    cron, instrumentation hook).
  */
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-export const llmProviderSchema = z.enum([
-  'anthropic',
-  'openai',
-  'openrouter',
-  'vercel-gateway',
-  'custom',
-]);
-export type LlmProvider = z.infer<typeof llmProviderSchema>;
+export type ResolvedDescriptorConfig = {
+  /** The descriptor id (e.g. `'anthropic'`, `'telegram'`). */
+  id: string;
+  /** Validated non-secret config map. Empty `{}` if no fields. */
+  config: Record<string, unknown>;
+};
+
+export type ResolvedProviderCategory = {
+  /**
+   * The active provider for this category, or `null` when no admin
+   * has configured one yet (which is normal until the setup wizard
+   * runs at least one category through).
+   */
+  active: ResolvedDescriptorConfig | null;
+  /**
+   * Every provider id in this category that has a stored config
+   * (whether or not it's currently active). Used by the admin UI to
+   * show "configured but not active" providers as switchable.
+   */
+  configured: string[];
+};
+
+export type ResolvedChannel = {
+  /** True iff the channel has at least one stored config row. */
+  configured: boolean;
+  /** Validated non-secret config map (includes `voiceEnabled`). */
+  config: Record<string, unknown>;
+};
 
 export type ResolvedSettings = {
   app: {
     setupCompletedAt: Date | null;
   };
-  llm: {
-    provider: LlmProvider;
-    defaultTextModel: string;
-    customBaseUrl: string | null;
+  providers: {
+    text: ResolvedProviderCategory;
+    imageVideo: ResolvedProviderCategory;
+    voice: ResolvedProviderCategory;
   };
-  imageVideo: {
-    provider: 'vercel-gateway' | null;
-    baseUrl: string | null;
-  };
-  elevenlabs: {
-    voiceId: string;
-    modelId: string;
-    configured: boolean;
-  };
+  channels: Record<string, ResolvedChannel>;
   telegram: {
+    /** Tuning knob — not in `providers.*` because it's purely runtime. */
     pollingIntervalMs: number;
-    configured: boolean;
   };
   composio: {
     configured: boolean;
@@ -78,60 +99,71 @@ export type ResolvedSettings = {
 };
 
 // ---------------------------------------------------------------------------
-// Schema for validated overrides
+// Helpers
 // ---------------------------------------------------------------------------
-//
-// Every key the resolver knows about must appear here with its expected
-// shape. `.nullable().optional()` is the standard form because the
-// underlying column is `jsonb` and a row may be missing or explicitly
-// `null` (admin cleared the override).
 
-const settingValueSchema = z
-  .object({
-    'app.setup_completed_at': z.string().nullable().optional(),
+const PROVIDER_CONFIG_KEY_RE =
+  /^providers\.(text|image-video|voice)\.([^.]+)\.config$/;
+const PROVIDER_ACTIVE_KEY_RE =
+  /^providers\.(text|image-video|voice)\.active$/;
+const CHANNEL_CONFIG_KEY_RE = /^channels\.([^.]+)\.config$/;
+const CHANNEL_CONFIGURED_KEY_RE = /^channels\.([^.]+)\.configured$/;
 
-    'llm.default_provider': llmProviderSchema.nullable().optional(),
-    'llm.default_text_model': z.string().min(1).nullable().optional(),
-    'llm.custom_base_url': z.string().url().nullable().optional(),
+function categoryKey(c: ProviderCategory): keyof ResolvedSettings['providers'] {
+  switch (c) {
+    case 'text':
+      return 'text';
+    case 'image-video':
+      return 'imageVideo';
+    case 'voice':
+      return 'voice';
+  }
+}
 
-    'image_video.provider': z
-      .enum(['vercel-gateway'])
-      .nullable()
-      .optional(),
-    'image_video.base_url': z.string().url().nullable().optional(),
+/** Validate a non-secret config object against a descriptor's field set. */
+function validateNonSecretConfig(
+  descriptor: { fields: { name: string; secret: boolean; required: boolean }[] },
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of descriptor.fields) {
+    if (field.secret) continue;
+    const value = raw[field.name];
+    if (value !== undefined && value !== null) {
+      out[field.name] = value;
+    }
+  }
+  return out;
+}
 
-    'elevenlabs.voice_id': z.string().min(1).nullable().optional(),
-    'elevenlabs.model_id': z.string().min(1).nullable().optional(),
-    'elevenlabs.configured': z.boolean().nullable().optional(),
+function emptyCategory(): ResolvedProviderCategory {
+  return { active: null, configured: [] };
+}
 
-    'telegram.polling_interval_ms': z
-      .number()
-      .int()
-      .positive()
-      .nullable()
-      .optional(),
-    'telegram.configured': z.boolean().nullable().optional(),
-
-    'composio.configured': z.boolean().nullable().optional(),
-  })
-  .partial();
-
-type SettingsRecord = z.infer<typeof settingValueSchema>;
-
-/** Every editable settings key. Used by the admin settings UI. */
-export const SETTINGS_KEYS = Object.keys(settingValueSchema.shape) as Array<
-  keyof SettingsRecord
->;
-export type SettingKey = (typeof SETTINGS_KEYS)[number];
+function emptyResolvedSettings(): ResolvedSettings {
+  return {
+    app: { setupCompletedAt: null },
+    providers: {
+      text: emptyCategory(),
+      imageVideo: emptyCategory(),
+      voice: emptyCategory(),
+    },
+    channels: {},
+    telegram: { pollingIntervalMs: DEFAULTS.telegram.pollingIntervalMs },
+    composio: { configured: false },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Resolver
 // ---------------------------------------------------------------------------
 
-export const resolveSettings = cache(async (): Promise<ResolvedSettings> => {
-  const supabase = await createClient();
-  return resolveSettingsAsService(supabase);
-});
+export const resolveSettings = cache(
+  async (): Promise<ResolvedSettings> => {
+    const supabase = await createClient();
+    return resolveSettingsAsService(supabase);
+  },
+);
 
 export async function resolveSettingsAsService(
   supabase: SupabaseClient,
@@ -144,106 +176,225 @@ export async function resolveSettingsAsService(
     throw new Error(`resolveSettings: ${error.message}`);
   }
 
-  const raw: Record<string, unknown> = {};
-  for (const row of (data ?? []) as Array<{ key: string; value: unknown }>) {
-    raw[row.key] = row.value;
+  const rows = (data ?? []) as Array<{ key: string; value: unknown }>;
+  const out = emptyResolvedSettings();
+
+  // Bucket the rows by their semantic role first; we'll merge config
+  // rows after the active pointers are known so the lookup is O(1).
+  const activeByCategory: Partial<Record<ProviderCategory, string>> = {};
+  const providerConfigs: Array<{
+    category: ProviderCategory;
+    providerId: string;
+    raw: Record<string, unknown>;
+  }> = [];
+  const channelConfigs: Array<{
+    channelId: string;
+    raw: Record<string, unknown>;
+  }> = [];
+  const channelConfigured = new Set<string>();
+
+  for (const { key, value } of rows) {
+    if (key === 'app.setup_completed_at') {
+      if (typeof value === 'string') {
+        out.app.setupCompletedAt = new Date(value);
+      }
+      continue;
+    }
+
+    if (key === 'composio.configured') {
+      out.composio.configured = value === true;
+      continue;
+    }
+
+    if (key === 'telegram.polling_interval_ms') {
+      // Legacy fall-through — newer code stores this on
+      // `channels.telegram.config.pollingIntervalMs`. We still honor
+      // an old top-level key for one cycle in case a hand-edited row
+      // exists, then prefer the channel config below.
+      if (typeof value === 'number' && value > 0) {
+        out.telegram.pollingIntervalMs = value;
+      }
+      continue;
+    }
+
+    const activeMatch = PROVIDER_ACTIVE_KEY_RE.exec(key);
+    if (activeMatch) {
+      const category = activeMatch[1] as ProviderCategory;
+      if (typeof value === 'string' && value.length > 0) {
+        activeByCategory[category] = value;
+      }
+      continue;
+    }
+
+    const providerConfigMatch = PROVIDER_CONFIG_KEY_RE.exec(key);
+    if (providerConfigMatch) {
+      const category = providerConfigMatch[1] as ProviderCategory;
+      const providerId = providerConfigMatch[2];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        providerConfigs.push({
+          category,
+          providerId,
+          raw: value as Record<string, unknown>,
+        });
+      }
+      continue;
+    }
+
+    const channelConfiguredMatch = CHANNEL_CONFIGURED_KEY_RE.exec(key);
+    if (channelConfiguredMatch && value === true) {
+      channelConfigured.add(channelConfiguredMatch[1]);
+      continue;
+    }
+
+    const channelConfigMatch = CHANNEL_CONFIG_KEY_RE.exec(key);
+    if (channelConfigMatch) {
+      const channelId = channelConfigMatch[1];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        channelConfigs.push({
+          channelId,
+          raw: value as Record<string, unknown>,
+        });
+      }
+      continue;
+    }
+
+    // Unknown key — log once but don't crash. A row left over from a
+    // deleted descriptor or a future schema addition should never take
+    // down the chat route.
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn(`[settings] ignoring unknown app_settings key: ${key}`);
+    }
   }
 
-  // safeParse — a malformed row in `app_settings` should NOT crash the
-  // chat route. Log it, fall back to defaults for the affected key, and
-  // let the admin notice via the settings UI (which renders the same
-  // schema and surfaces validation errors).
-  const parsed = settingValueSchema.safeParse(raw);
-  if (!parsed.success) {
-    console.warn(
-      '[settings] invalid app_settings row(s) — falling back to defaults',
-      parsed.error.issues,
-    );
+  // Merge provider configs into the resolved object.
+  for (const { category, providerId, raw } of providerConfigs) {
+    const descriptor = getProvider(category, providerId);
+    if (!descriptor) {
+      console.warn(
+        `[settings] no descriptor for provider ${category}/${providerId}, skipping`,
+      );
+      continue;
+    }
+    const slot = out.providers[categoryKey(category)];
+    slot.configured.push(providerId);
+    if (activeByCategory[category] === providerId) {
+      slot.active = {
+        id: providerId,
+        config: validateNonSecretConfig(descriptor, raw),
+      };
+    }
   }
-  const overrides: SettingsRecord = parsed.success ? parsed.data : {};
 
-  return merge(overrides);
-}
+  // For each category, log when an `active` pointer references a
+  // provider that has no config row — that's a corrupt state and we
+  // surface it as `null` so call sites fall back to "no provider".
+  for (const category of PROVIDER_CATEGORIES) {
+    const targetId = activeByCategory[category];
+    const slot = out.providers[categoryKey(category)];
+    if (targetId && !slot.active) {
+      console.warn(
+        `[settings] providers.${category}.active = ${targetId} but no config row exists`,
+      );
+    }
+  }
 
-function merge(o: SettingsRecord): ResolvedSettings {
-  const setupAt = o['app.setup_completed_at'];
+  // Merge channel configs.
+  for (const { channelId, raw } of channelConfigs) {
+    const { getChannel } = await import('@/lib/channels/registry');
+    const descriptor = getChannel(channelId);
+    if (!descriptor) {
+      console.warn(
+        `[settings] no descriptor for channel ${channelId}, skipping`,
+      );
+      continue;
+    }
+    const validated = validateNonSecretConfig(descriptor, raw);
+    // voiceEnabled is a meta field outside the descriptor's normal
+    // field set; preserve it verbatim if present.
+    if (typeof raw.voiceEnabled === 'boolean') {
+      validated.voiceEnabled = raw.voiceEnabled;
+    }
+    out.channels[channelId] = {
+      configured: true,
+      config: validated,
+    };
+  }
 
-  return {
-    app: {
-      setupCompletedAt: setupAt ? new Date(setupAt) : null,
-    },
-    llm: {
-      provider: o['llm.default_provider'] ?? DEFAULTS.llm.provider,
-      defaultTextModel:
-        o['llm.default_text_model'] ?? DEFAULTS.llm.defaultTextModel,
-      customBaseUrl:
-        o['llm.custom_base_url'] ?? DEFAULTS.llm.customBaseUrl,
-    },
-    imageVideo: {
-      provider: o['image_video.provider'] ?? DEFAULTS.imageVideo.provider,
-      baseUrl: o['image_video.base_url'] ?? DEFAULTS.imageVideo.baseUrl,
-    },
-    elevenlabs: {
-      voiceId: o['elevenlabs.voice_id'] ?? DEFAULTS.elevenlabs.voiceId,
-      modelId: o['elevenlabs.model_id'] ?? DEFAULTS.elevenlabs.modelId,
-      configured: o['elevenlabs.configured'] ?? false,
-    },
-    telegram: {
-      pollingIntervalMs:
-        o['telegram.polling_interval_ms'] ??
-        DEFAULTS.telegram.pollingIntervalMs,
-      configured: o['telegram.configured'] ?? false,
-    },
-    composio: {
-      configured: o['composio.configured'] ?? false,
-    },
-  };
+  // Some channels were marked configured via the boolean key but had
+  // no config row yet (e.g. wizard wrote the flag before the config).
+  // Surface them as configured-but-empty so the admin UI can show a
+  // re-edit prompt.
+  for (const channelId of channelConfigured) {
+    if (!out.channels[channelId]) {
+      out.channels[channelId] = { configured: true, config: {} };
+    }
+  }
+
+  // Channels override the legacy top-level Telegram polling default.
+  const telegramConfig = out.channels.telegram?.config;
+  if (
+    telegramConfig &&
+    typeof telegramConfig.pollingIntervalMs === 'number' &&
+    telegramConfig.pollingIntervalMs > 0
+  ) {
+    out.telegram.pollingIntervalMs = telegramConfig.pollingIntervalMs;
+  }
+
+  // Make sure every channel descriptor at least appears in the map
+  // (with `configured: false`) so the admin UI can render an "Add"
+  // card uniformly.
+  for (const channel of listChannels()) {
+    if (!out.channels[channel.id]) {
+      out.channels[channel.id] = { configured: false, config: {} };
+    }
+  }
+
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Override helpers (admin settings UI)
+// Helpers for the admin actions layer
 // ---------------------------------------------------------------------------
 
 /**
- * Read the raw stored override value (or `null` if not set) for one
- * key. The admin settings UI uses this to render "default" vs
- * "overridden" badges next to each field — `null` means "falling back
- * to Tier 0".
+ * Convenience helper used by Server Actions: write a single row to
+ * `app_settings`. Validation against the per-key schema happens at the
+ * action layer (see `src/lib/providers/actions.ts` and
+ * `src/lib/channels/actions.ts`) — this helper is the raw Postgres
+ * upsert.
  */
-export async function readOverride(
-  key: SettingKey,
+export async function upsertSetting(
+  supabase: SupabaseClient,
+  key: string,
+  value: unknown,
+): Promise<void> {
+  if (value === null || value === undefined) {
+    const { error } = await supabase
+      .from('app_settings')
+      .delete()
+      .eq('key', key);
+    if (error) throw new Error(`upsertSetting(${key}): ${error.message}`);
+    return;
+  }
+  const { error } = await supabase
+    .from('app_settings')
+    .upsert({ key, value }, { onConflict: 'key' });
+  if (error) throw new Error(`upsertSetting(${key}): ${error.message}`);
+}
+
+/**
+ * Read a single row's raw value (or `null` if missing). Used by the
+ * admin UI to render "default" vs "overridden" badges.
+ */
+export async function readSetting(
+  supabase: SupabaseClient,
+  key: string,
 ): Promise<unknown | null> {
-  const supabase = await createClient();
   const { data, error } = await supabase
     .from('app_settings')
     .select('value')
     .eq('key', key)
     .maybeSingle();
-  if (error) throw new Error(`readOverride(${key}): ${error.message}`);
+  if (error) throw new Error(`readSetting(${key}): ${error.message}`);
   return data?.value ?? null;
-}
-
-/**
- * Write or clear a single override. Pass `null` to remove the row and
- * fall back to the Tier 0 default.
- */
-export async function writeOverride(
-  key: SettingKey,
-  value: unknown,
-): Promise<void> {
-  const supabase = await createClient();
-  if (value === null || value === undefined) {
-    const { error } = await supabase.from('app_settings').delete().eq('key', key);
-    if (error) throw new Error(`writeOverride(${key}): ${error.message}`);
-    return;
-  }
-
-  // Validate the single key against its schema before writing.
-  const partial = settingValueSchema.parse({ [key]: value });
-  const validated = partial[key];
-
-  const { error } = await supabase
-    .from('app_settings')
-    .upsert({ key, value: validated }, { onConflict: 'key' });
-  if (error) throw new Error(`writeOverride(${key}): ${error.message}`);
 }

@@ -9,8 +9,15 @@ import {
 } from '@mastra/observability';
 
 import { env } from '@/lib/env';
-import { personalAssistant } from './agents/personal-assistant';
+import { createPersonalAssistant } from './agents/personal-assistant';
 import { storage } from './storage';
+
+// Top-level await so the agent's `channels` slot is populated from
+// `app_settings` + Vault before the Mastra constructor runs. The
+// alternative — constructing with empty channels and patching later —
+// would race against `AgentChannels.initialize()`, which kicks off
+// polling immediately when the Mastra instance is built.
+const personalAssistant = await createPersonalAssistant();
 
 /**
  * Auth provider for the Mastra HTTP server (Mastra Studio on :4111, plus any

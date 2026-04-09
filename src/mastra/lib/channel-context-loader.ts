@@ -53,41 +53,30 @@ export async function loadChannelContextOnto(
     );
   }
 
-  // Phase 1 supports Telegram only — other platforms will land their
-  // own link tables and a small dispatch table here.
-  if (channel.platform !== 'telegram') {
-    throw new AppNotConfiguredError(
-      `channel platform not yet supported: ${channel.platform}`,
-    );
-  }
-
-  const numericId = Number.parseInt(channel.userId, 10);
-  if (!Number.isFinite(numericId)) {
-    throw new AppNotConfiguredError(
-      `invalid telegram user id: ${channel.userId}`,
-    );
-  }
-
+  // The channel registry is the source of truth for which platforms
+  // exist. Any descriptor with a `user_channel_bindings` row is
+  // serviceable — there's no per-platform special case here anymore.
   const supabase = createServiceClient();
 
-  const { data: link, error: linkError } = await supabase
-    .from('user_telegram_links')
+  const { data: binding, error: bindingError } = await supabase
+    .from('user_channel_bindings')
     .select('user_id')
-    .eq('telegram_user_id', numericId)
+    .eq('channel_id', channel.platform)
+    .eq('external_id', channel.userId)
     .maybeSingle();
 
-  if (linkError) {
+  if (bindingError) {
     throw new Error(
-      `loadChannelContextOnto: link lookup failed: ${linkError.message}`,
+      `loadChannelContextOnto: binding lookup failed: ${bindingError.message}`,
     );
   }
-  if (!link?.user_id) {
+  if (!binding?.user_id) {
     throw new AppNotConfiguredError(
-      `telegram user ${channel.userId} is not linked to any account`,
+      `${channel.platform} user ${channel.userId} is not bound to any account`,
     );
   }
 
-  const userId = link.user_id as string;
+  const userId = binding.user_id as string;
 
   // Pull role from auth.users so the synthetic CurrentUser carries
   // the right value. service-role bypasses RLS.

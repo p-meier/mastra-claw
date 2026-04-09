@@ -91,8 +91,6 @@ const requestSchema = z.object({
   messages: z.array(uiMessageShape),
   wizardDraft: z.object({
     tone: z.enum(['casual', 'crisp', 'friendly', 'playful']),
-    telegramSkipped: z.boolean(),
-    telegramUserId: z.string().nullable(),
   }),
 });
 

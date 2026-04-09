@@ -6,7 +6,9 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import type { LanguageModelV3 } from '@ai-sdk/provider-v6';
 
-import type { LlmProvider } from './mastra-for';
+import type { TextProviderId } from '@/lib/providers/text';
+
+type LlmProvider = TextProviderId;
 
 /** Default OpenRouter API base URL when the credential doesn't supply one. */
 const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';

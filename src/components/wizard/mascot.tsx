@@ -36,7 +36,7 @@ export function Mascot({
   return (
     <div className={cn('flex flex-col items-center gap-3', className)}>
       {label ? (
-        <div className="text-2xl font-medium tracking-tight text-white">
+        <div className="text-2xl font-medium tracking-tight text-foreground">
           {label}
         </div>
       ) : null}

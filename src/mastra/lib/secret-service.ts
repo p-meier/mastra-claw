@@ -132,6 +132,81 @@ export const appSecrets = {
   get: rpcAppSecretGet,
   delete: rpcAppSecretDelete,
   list: rpcAppSecretList,
+
+  // ---------------------------------------------------------------------
+  // Namespaced helpers
+  // ---------------------------------------------------------------------
+  //
+  // The provider/channel registries store many secrets per descriptor:
+  //   provider:text:anthropic:apiKey
+  //   provider:tts:elevenlabs:apiKey
+  //   channel:slack:botToken
+  //   channel:slack:signingSecret
+  //
+  // Rather than minting one named constant per (descriptor, field), we
+  // namespace the Vault key. The helpers below build the canonical name
+  // and dispatch to the same RPCs as the unnamespaced API.
+  //
+  // The namespace string is a free-form path with `:` separators
+  // (e.g. `'provider:text'` or `'channel'`). We never echo `:` from
+  // user input — descriptor IDs and field names are validated against
+  // their registry before they reach this layer.
+
+  /** Build the unprefixed Vault name `<namespace>:<id>:<field>`. */
+  buildName(namespace: string, id: string, field: string): string {
+    return `${namespace}:${id}:${field}`;
+  },
+
+  async setNamespacedField(
+    namespace: string,
+    id: string,
+    field: string,
+    value: string,
+  ): Promise<void> {
+    return rpcAppSecretSet(
+      appSecrets.buildName(namespace, id, field),
+      value,
+    );
+  },
+
+  async getNamespacedField(
+    namespace: string,
+    id: string,
+    field: string,
+  ): Promise<string | null> {
+    return rpcAppSecretGet(appSecrets.buildName(namespace, id, field));
+  },
+
+  /**
+   * Delete every secret stored under `<namespace>:<id>:*`. Used when an
+   * admin removes a configured provider/channel.
+   */
+  async deleteNamespace(namespace: string, id: string): Promise<void> {
+    const prefix = `${namespace}:${id}:`;
+    const all = await rpcAppSecretList();
+    await Promise.all(
+      all
+        .filter((name) => name.startsWith(prefix))
+        .map((name) => rpcAppSecretDelete(name)),
+    );
+  },
+
+  /**
+   * List the field names that currently have a stored value under
+   * `<namespace>:<id>`. The returned strings are *just* the field
+   * portion (everything after the trailing `:`), suitable for building
+   * the SecretFieldStatus map that the edit form consumes.
+   */
+  async listFieldsInNamespace(
+    namespace: string,
+    id: string,
+  ): Promise<string[]> {
+    const prefix = `${namespace}:${id}:`;
+    const all = await rpcAppSecretList();
+    return all
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => name.slice(prefix.length));
+  },
 } as const;
 
 /**

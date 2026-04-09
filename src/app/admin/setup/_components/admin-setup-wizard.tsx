@@ -1,784 +1,420 @@
 'use client';
 
-import { useState, useTransition, type ReactNode } from 'react';
+import { useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 
+import {
+  DescriptorConfigForm,
+  type DescriptorFormSubmitResult,
+} from '@/components/descriptors/descriptor-config-form';
 import { BackButton } from '@/components/wizard/back-button';
 import { InfoBox, StepShell } from '@/components/wizard/step-shell';
-
 import {
-  commitAdminSetupAction,
-  probeComposioAction,
-  probeElevenlabsAction,
-  probeImageVideoAction,
-  probeLlmAction,
-  probeTelegramAction,
-  type AdminSetupDraft,
-} from '../actions';
-import type { LlmProvider } from '@/lib/setup/probes';
+  probeProviderAction,
+  saveProviderConfigAction,
+} from '@/lib/providers/actions';
+import type { ProviderCategory } from '@/lib/providers/registry';
+
+import { finalizeAdminSetupAction } from '../actions';
 
 /**
- * Single client component that drives the entire admin setup flow.
+ * Slimmed-down admin setup wizard.
  *
- * All in-progress state lives in `useState` here. NO database writes
- * happen until the very last step (Composio) — at that point we call
- * `commitAdminSetupAction(draft)` which atomically writes everything
- * (Vault secrets + app_settings rows + setup_completed_at).
+ * The old wizard hardcoded a step per credential type (LLM key, model
+ * picker, image/video, ElevenLabs, Telegram, Composio) and then
+ * committed everything at the end. Channels and Composio have moved
+ * out to their own admin pages, and providers go through the shared
+ * `descriptor-config-form` + per-step `saveProviderConfigAction`. What
+ * remains is exactly what every fresh install needs:
  *
- * Each step has a Back button that simply decrements `step` — no
- * server round-trip, no DB cleanup. Continue runs the relevant probe
- * server-side (which is pure — no writes), and only advances `step`
- * if the probe returns ok=true. Probe results that downstream steps
- * need (like the model list from step 2) are stored on the draft.
+ *   1. Pick + configure a text-model provider (required)
+ *   2. Pick + configure an image/video provider (optional;
+ *      auto-skipped when the text provider was Vercel AI Gateway —
+ *      the gateway already handles image/video)
+ *   3. Pick + configure a TTS provider (optional)
+ *   4. Finalize → flip `app.setup_completed_at`, hand off to personal
+ *      onboarding
+ *
+ * Every provider step writes the moment the admin clicks Save inside
+ * the form. Back navigation is allowed but does NOT roll back stored
+ * configs — the admin can revisit a step to swap providers, but
+ * leaving a step half-done means the previous save still stands. This
+ * matches the new "providers are independently editable from
+ * /admin/settings" model.
  */
 
-type DraftState = AdminSetupDraft & {
-  llmModels: string[];
-  telegramBotUsername: string | null;
-};
+type Stage = 'text' | 'image-video' | 'voice' | 'finalize';
 
-const PROVIDERS: Array<{
-  id: LlmProvider;
-  name: string;
+type AddableProviderProps = {
+  id: string;
+  displayName: string;
+  blurb: string;
   badge?: string;
-  short: string;
-  why: string;
-}> = [
-  {
-    id: 'vercel-gateway',
-    name: 'Vercel AI Gateway',
-    badge: 'Recommended',
-    short: 'Text + image + video + search, one key.',
-    why: 'Vercel AI Gateway gives you Anthropic, OpenAI, Google, and OpenRouter through a single account — plus Perplexity & parallel.ai for search and image / video generation. One key, one bill, fewer accounts to manage.',
-  },
-  {
-    id: 'anthropic',
-    name: 'Anthropic',
-    short: 'Direct Claude API.',
-    why: 'Use Anthropic directly when you already have an account or need access to features that aren\'t on the gateway yet.',
-  },
-  {
-    id: 'openai',
-    name: 'OpenAI',
-    short: 'Direct GPT API.',
-    why: 'Use OpenAI directly for the GPT model family.',
-  },
-  {
-    id: 'openrouter',
-    name: 'OpenRouter',
-    short: 'Aggregator across many providers.',
-    why: 'OpenRouter routes one key to dozens of providers — useful for experimentation, less curated than the Vercel gateway.',
-  },
-  {
-    id: 'custom',
-    name: 'Custom (OpenAI-compatible)',
-    short: 'Ollama, LM Studio, vLLM, private deployments.',
-    why: 'Point at any OpenAI-compatible endpoint via base URL.',
-  },
-];
-
-const PROVIDER_KEY_HELP: Record<string, string> = {
-  anthropic: 'https://console.anthropic.com/settings/keys',
-  openai: 'https://platform.openai.com/api-keys',
-  openrouter: 'https://openrouter.ai/keys',
-  'vercel-gateway': 'https://vercel.com/dashboard/ai-gateway',
+  fields: SerializableField[];
 };
 
-const TOTAL_STEPS = 7;
+type SerializableField = {
+  name: string;
+  label: string;
+  type:
+    | 'password'
+    | 'text'
+    | 'url'
+    | 'number'
+    | 'boolean'
+    | 'select'
+    | 'string-array'
+    | 'json'
+    | 'model-select';
+  required: boolean;
+  secret: boolean;
+  helpUrl?: string;
+  helpText?: string;
+  placeholder?: string;
+  defaultValue?: string;
+  options?: Array<{ value: string; label: string }>;
+  showWhen?: { field: string; equals: string | string[] };
+};
 
-export function AdminSetupWizard() {
+export type AdminSetupWizardProps = {
+  textProviders: AddableProviderProps[];
+  imageVideoProviders: AddableProviderProps[];
+  voiceProviders: AddableProviderProps[];
+  initialActive: {
+    text: string | null;
+    imageVideo: string | null;
+    voice: string | null;
+  };
+};
+
+const STAGE_ORDER: Stage[] = ['text', 'image-video', 'voice', 'finalize'];
+
+export function AdminSetupWizard({
+  textProviders,
+  imageVideoProviders,
+  voiceProviders,
+  initialActive,
+}: AdminSetupWizardProps) {
   const router = useRouter();
-  const [step, setStep] = useState<1 | 2 | 3 | 4 | 5 | 6 | 7>(1);
-  const [draft, setDraft] = useState<DraftState>({
-    provider: 'vercel-gateway',
-    customBaseUrl: null,
-    llmKey: '',
-    llmModels: [],
-    defaultTextModel: '',
-    imageVideoSkipped: false,
-    imageVideoKey: null,
-    elevenlabsSkipped: false,
-    elevenlabsKey: null,
-    telegramSkipped: false,
-    telegramToken: null,
-    telegramBotUsername: null,
-    composioSkipped: false,
-    composioKey: null,
-  });
+  const [stage, setStage] = useState<Stage>('text');
+  const [pickedText, setPickedText] = useState<string | null>(initialActive.text);
+  const [pickedImageVideo, setPickedImageVideo] = useState<string | null>(
+    initialActive.imageVideo,
+  );
+  const [pickedVoice, setPickedVoice] = useState<string | null>(
+    initialActive.voice,
+  );
   const [error, setError] = useState<string | null>(null);
-  const [isPending, startTransition] = useTransition();
+  const [pending, startTransition] = useTransition();
 
-  const update = (patch: Partial<DraftState>) =>
-    setDraft((prev) => ({ ...prev, ...patch }));
+  const stepNumber = STAGE_ORDER.indexOf(stage) + 1;
+  const totalSteps = STAGE_ORDER.length;
 
-  const goBack = () => {
+  function goNext(next: Stage): void {
     setError(null);
-    if (step === 1) return;
-    // Auto-skipped image/video step (when text provider is Vercel AI
-    // Gateway): skip back over it too.
-    if (step === 5 && draft.provider === 'vercel-gateway') {
-      setStep(3);
+    // Auto-skip image/video when the active text provider is already
+    // the Vercel AI Gateway — the same key covers both.
+    if (next === 'image-video' && pickedText === 'vercel-gateway') {
+      setStage('voice');
       return;
     }
-    setStep((step - 1) as typeof step);
-  };
+    setStage(next);
+  }
 
-  const advance = (skipImageVideo: boolean) => {
+  function goBack(): void {
     setError(null);
-    if (step === 7) return;
-    if (step === 3 && skipImageVideo) {
-      setStep(5);
-      return;
+    const idx = STAGE_ORDER.indexOf(stage);
+    if (idx <= 0) return;
+    let prev = STAGE_ORDER[idx - 1];
+    if (prev === 'image-video' && pickedText === 'vercel-gateway') {
+      prev = 'text';
     }
-    setStep((step + 1) as typeof step);
-  };
+    setStage(prev);
+  }
 
-  // ----- Step 1: provider -----
-  const onContinueProvider = () => {
+  function handleFinalize(): void {
     setError(null);
-    if (!draft.provider) {
-      setError('Pick a provider');
-      return;
-    }
-    if (draft.provider === 'custom' && !draft.customBaseUrl) {
-      setError('Custom provider requires a base URL');
-      return;
-    }
-    advance(false);
-  };
-
-  // ----- Step 2: LLM key -----
-  const onContinueLlmKey = () => {
-    setError(null);
-    if (!draft.llmKey.trim()) {
-      setError('API key is empty');
-      return;
-    }
     startTransition(async () => {
-      const res = await probeLlmAction(
-        draft.provider,
-        draft.llmKey.trim(),
-        draft.customBaseUrl,
-      );
-      if (!res.ok) {
-        setError(res.error);
+      const result = await finalizeAdminSetupAction();
+      if (!result.ok) {
+        setError(result.error);
         return;
       }
-      // Pre-select a sensible default model from the returned list.
-      // Priority order: prefer the latest Claude Sonnet (4.6), then any
-      // Sonnet 4.x, then GPT-5 / GPT-4o, then anything that mentions
-      // "sonnet". The original regex picked "the first model containing
-      // 'sonnet'" which on the Vercel gateway sorts alphabetically and
-      // landed on the older claude-3.7-sonnet.
-      const PREFERENCE_PATTERNS: RegExp[] = [
-        /claude-sonnet-4[._-]?6/i,
-        /claude-sonnet-4[._-]?5/i,
-        /claude-sonnet-4/i,
-        /claude-.*sonnet-4/i,
-        /gpt-5/i,
-        /gpt-4o/i,
-        /sonnet/i,
-      ];
-      let defaultGuess = '';
-      for (const re of PREFERENCE_PATTERNS) {
-        const match = res.models.find((m) => re.test(m));
-        if (match) {
-          defaultGuess = match;
-          break;
-        }
-      }
-      if (!defaultGuess) defaultGuess = res.models[0] ?? '';
-      update({ llmModels: res.models, defaultTextModel: defaultGuess });
-      advance(false);
-    });
-  };
-
-  // ----- Step 3: model -----
-  const onContinueModel = () => {
-    setError(null);
-    if (!draft.defaultTextModel) {
-      setError('Pick a model');
-      return;
-    }
-    // Auto-skip image/video if the text provider is already AI Gateway
-    advance(draft.provider === 'vercel-gateway');
-  };
-
-  // ----- Step 4: image/video -----
-  const onContinueImageVideo = (skip: boolean) => {
-    setError(null);
-    if (skip) {
-      update({ imageVideoSkipped: true, imageVideoKey: null });
-      advance(false);
-      return;
-    }
-    if (!draft.imageVideoKey?.trim()) {
-      setError('API key is empty');
-      return;
-    }
-    startTransition(async () => {
-      const res = await probeImageVideoAction(draft.imageVideoKey!.trim());
-      if (!res.ok) {
-        setError(res.error);
-        return;
-      }
-      update({ imageVideoSkipped: false });
-      advance(false);
-    });
-  };
-
-  // ----- Step 5: ElevenLabs -----
-  const onContinueElevenlabs = (skip: boolean) => {
-    setError(null);
-    if (skip) {
-      update({ elevenlabsSkipped: true, elevenlabsKey: null });
-      advance(false);
-      return;
-    }
-    if (!draft.elevenlabsKey?.trim()) {
-      setError('API key is empty');
-      return;
-    }
-    startTransition(async () => {
-      const res = await probeElevenlabsAction(draft.elevenlabsKey!.trim());
-      if (!res.ok) {
-        setError(res.error);
-        return;
-      }
-      update({ elevenlabsSkipped: false });
-      advance(false);
-    });
-  };
-
-  // ----- Step 6: Telegram -----
-  const onContinueTelegram = (skip: boolean) => {
-    setError(null);
-    if (skip) {
-      update({
-        telegramSkipped: true,
-        telegramToken: null,
-        telegramBotUsername: null,
-      });
-      advance(false);
-      return;
-    }
-    if (!draft.telegramToken?.trim()) {
-      setError('Bot token is empty');
-      return;
-    }
-    startTransition(async () => {
-      const res = await probeTelegramAction(draft.telegramToken!.trim());
-      if (!res.ok) {
-        setError(res.error);
-        return;
-      }
-      update({ telegramSkipped: false, telegramBotUsername: res.botUsername });
-      advance(false);
-    });
-  };
-
-  // ----- Step 7: Composio + final commit -----
-  const onFinishComposio = (skip: boolean) => {
-    setError(null);
-    const next: DraftState = skip
-      ? { ...draft, composioSkipped: true, composioKey: null }
-      : draft;
-
-    if (!skip && !next.composioKey?.trim()) {
-      setError('API key is empty');
-      return;
-    }
-
-    startTransition(async () => {
-      if (!skip) {
-        const res = await probeComposioAction(next.composioKey!.trim());
-        if (!res.ok) {
-          setError(res.error);
-          return;
-        }
-      }
-
-      // Final commit — single atomic write of everything
-      const { llmModels: _, telegramBotUsername: __, ...committable } = next;
-      const commit = await commitAdminSetupAction(committable);
-      if (!commit.ok) {
-        setError(commit.error);
-        return;
-      }
-      // Proxy gate now sees app.setup_completed_at and will route us
-      // off /admin/setup → handoff screen on the next navigation.
       router.refresh();
     });
-  };
+  }
 
-  // -------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------
-
-  // The first step has nothing to go back to — BackButton omits itself
-  // entirely when canGoBack is false.
-  const footer = (
-    backDisabled: boolean,
-    onContinue: () => void,
-    continueDisabled: boolean,
-    continueLabel: string = 'Continue',
-    skipButton?: ReactNode,
-  ) => (
-    <>
-      <div className="flex items-center gap-4">
-        <BackButton
-          onClick={goBack}
-          disabled={isPending}
-          canGoBack={!backDisabled}
-        />
-        {skipButton}
-      </div>
-      <button
-        type="button"
-        onClick={onContinue}
-        disabled={continueDisabled || isPending}
-        className="inline-flex h-10 items-center rounded-lg bg-amber-500 px-5 text-sm font-semibold text-black shadow-[0_8px_32px_-8px_rgba(245,158,11,0.5)] transition-all hover:bg-amber-400 disabled:pointer-events-none disabled:opacity-40"
+  if (stage === 'finalize') {
+    return (
+      <StepShell
+        mascotLabel="MastraClaw"
+        step={stepNumber}
+        totalSteps={totalSteps}
+        question="Ready to finish?"
+        footer={
+          <>
+            <BackButton onClick={goBack} canGoBack />
+            <button
+              type="button"
+              onClick={handleFinalize}
+              disabled={pending}
+              className="inline-flex h-10 items-center rounded-lg bg-primary px-5 text-sm font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {pending ? 'Finishing…' : 'Finish setup'}
+            </button>
+          </>
+        }
       >
-        {isPending ? 'Working…' : continueLabel}
-      </button>
-    </>
-  );
+        <div className="flex flex-col gap-4 text-sm text-muted-foreground">
+          <p>
+            You can change any of this later from the settings — switch
+            providers, swap voices, or connect new messaging accounts
+            without coming back here.
+          </p>
+          <ul className="ml-4 list-disc space-y-1">
+            <li>
+              Text provider:{' '}
+              <strong>{pickedText ?? 'not configured'}</strong>
+            </li>
+            <li>
+              Image &amp; video:{' '}
+              <strong>
+                {pickedText === 'vercel-gateway'
+                  ? 'shared with Vercel AI Gateway'
+                  : (pickedImageVideo ?? 'skipped')}
+              </strong>
+            </li>
+            <li>
+              Voice (Speech ↔ Text):{' '}
+              <strong>{pickedVoice ?? 'skipped'}</strong>
+            </li>
+          </ul>
+          {error && <p className="text-destructive">{error}</p>}
+        </div>
+      </StepShell>
+    );
+  }
 
-  // Render-step lookup keeps the JSX flat
-  switch (step) {
-    case 1:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={1}
-          totalSteps={TOTAL_STEPS}
-          question="Pick your AI brain"
-          footer={footer(true, onContinueProvider, !draft.provider)}
-        >
-          <div className="flex flex-col gap-6">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {PROVIDERS.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => update({ provider: p.id })}
-                  className={`group relative flex flex-col items-start gap-1 rounded-xl border px-4 py-3 text-left transition-all ${
-                    draft.provider === p.id
-                      ? 'border-amber-400/60 bg-amber-500/[0.08] ring-2 ring-amber-400/30'
-                      : 'border-white/[0.08] bg-white/[0.025] hover:border-white/[0.18] hover:bg-white/[0.04]'
-                  }`}
-                >
-                  <div className="flex w-full items-center justify-between">
-                    <span className="text-sm font-medium text-white">
-                      {p.name}
-                    </span>
-                    {p.badge ? (
-                      <span className="rounded-full bg-amber-500/15 px-2 py-0.5 font-mono text-[9px] uppercase tracking-[0.15em] text-amber-200">
-                        {p.badge}
-                      </span>
-                    ) : null}
-                  </div>
-                  <span className="text-xs text-white/55">{p.short}</span>
-                </button>
-              ))}
-            </div>
+  const config = stageConfig[stage];
+  const providers =
+    stage === 'text'
+      ? textProviders
+      : stage === 'image-video'
+        ? imageVideoProviders
+        : voiceProviders;
+  const picked =
+    stage === 'text'
+      ? pickedText
+      : stage === 'image-video'
+        ? pickedImageVideo
+        : pickedVoice;
+  const setPicked =
+    stage === 'text'
+      ? setPickedText
+      : stage === 'image-video'
+        ? setPickedImageVideo
+        : setPickedVoice;
 
-            {draft.provider === 'custom' && (
-              <div className="flex flex-col gap-2">
-                <label
-                  htmlFor="customBaseUrl"
-                  className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45"
-                >
-                  Base URL
-                </label>
-                <input
-                  id="customBaseUrl"
-                  type="url"
-                  placeholder="https://your-endpoint.example/v1"
-                  value={draft.customBaseUrl ?? ''}
-                  onChange={(e) =>
-                    update({ customBaseUrl: e.target.value || null })
-                  }
-                  className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 placeholder:text-white/25 outline-none transition-all focus:border-amber-400/50 focus:bg-white/[0.06] focus:ring-4 focus:ring-amber-400/15"
-                />
-              </div>
-            )}
+  const pickedDescriptor = providers.find((p) => p.id === picked);
 
-            <InfoBox>
-              <p>
-                We recommend <strong>Vercel AI Gateway</strong> because it
-                gives you access to Claude, GPT, Gemini, image generation,
-                video generation, and even search providers like Perplexity
-                and parallel.ai —{' '}
-                <em>through one single account and one key</em>. You can
-                change this later.
-              </p>
-              <p className="text-white/55">
-                {PROVIDERS.find((p) => p.id === draft.provider)?.why}
-              </p>
-            </InfoBox>
-
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
-
-    case 2:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={2}
-          totalSteps={TOTAL_STEPS}
-          question="Drop in your API key"
-          footer={footer(
-            false,
-            onContinueLlmKey,
-            !draft.llmKey.trim(),
-            'Test & Continue',
+  return (
+    <StepShell
+      mascotLabel="MastraClaw"
+      step={stepNumber}
+      totalSteps={totalSteps}
+      question={config.question}
+      footer={
+        <>
+          <BackButton onClick={goBack} canGoBack={stage !== 'text'} />
+          {stage !== 'text' && (
+            <button
+              type="button"
+              onClick={() => goNext(nextStage(stage))}
+              className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+            >
+              Skip this step
+            </button>
           )}
-          thinking={isPending}
-        >
-          <div className="flex flex-col gap-5">
-            <KeyInput
-              label="API Key"
-              placeholder={
-                draft.provider === 'anthropic'
-                  ? 'sk-ant-…'
-                  : draft.provider === 'vercel-gateway'
-                    ? 'vck_…'
-                    : 'sk-…'
+          {!pickedDescriptor && stage === 'text' && (
+            <span className="text-xs text-muted-foreground">
+              Pick a provider to continue
+            </span>
+          )}
+        </>
+      }
+    >
+      <div className="flex flex-col gap-6">
+        <InfoBox title={config.helpTitle}>{config.helpBody}</InfoBox>
+
+        <ProviderPicker
+          providers={providers}
+          picked={picked}
+          onPick={setPicked}
+        />
+
+        {pickedDescriptor && (
+          <div className="rounded-xl border bg-card p-4">
+            <DescriptorConfigForm
+              descriptor={{
+                id: pickedDescriptor.id,
+                displayName: pickedDescriptor.displayName,
+                fields: pickedDescriptor.fields,
+              }}
+              secretFieldStatus={{}}
+              submitLabel="Save & continue"
+              onSubmit={async (values) => {
+                const result = await saveProviderConfigAction(
+                  stageCategory(stage),
+                  pickedDescriptor.id,
+                  values,
+                  { setActive: true },
+                );
+                if (result.ok) {
+                  goNext(nextStage(stage));
+                }
+                return result;
+              }}
+              onProbe={async (values) =>
+                (await probeProviderAction(
+                  stageCategory(stage),
+                  pickedDescriptor.id,
+                  values,
+                )) as DescriptorFormSubmitResult
               }
-              helpHref={PROVIDER_KEY_HELP[draft.provider]}
-              value={draft.llmKey}
-              onChange={(v) => update({ llmKey: v })}
-              disabled={isPending}
             />
-            <InfoBox>
-              <p>
-                Paste the API key for your selected provider. We hit their
-                /models endpoint to make sure the key works <em>before</em>{' '}
-                advancing — if the test fails, you stay on this screen with
-                an inline error.
-              </p>
-              <p className="text-white/55">
-                Nothing is written to the database during the wizard. The
-                key is held in memory until you finish the last step, at
-                which point everything is saved at once.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
           </div>
-        </StepShell>
-      );
+        )}
 
-    case 3:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={3}
-          totalSteps={TOTAL_STEPS}
-          question="Pick a default model"
-          footer={footer(false, onContinueModel, !draft.defaultTextModel)}
-        >
-          <div className="flex flex-col gap-5">
-            <div className="flex flex-col gap-2">
-              <label
-                htmlFor="model"
-                className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45"
-              >
-                Default text model
-              </label>
-              <select
-                id="model"
-                value={draft.defaultTextModel}
-                onChange={(e) => update({ defaultTextModel: e.target.value })}
-                className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 outline-none transition-all focus:border-amber-400/50"
-              >
-                {draft.llmModels.length === 0 ? (
-                  <option value="">— no models available —</option>
-                ) : (
-                  draft.llmModels.map((m) => (
-                    <option key={m} value={m} className="bg-[#08080b]">
-                      {m}
-                    </option>
-                  ))
-                )}
-              </select>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </div>
+    </StepShell>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Provider picker
+// ---------------------------------------------------------------------------
+
+function ProviderPicker({
+  providers,
+  picked,
+  onPick,
+}: {
+  providers: AddableProviderProps[];
+  picked: string | null;
+  onPick: (id: string) => void;
+}) {
+  if (providers.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No providers available in this category yet.
+      </p>
+    );
+  }
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+      {providers.map((p) => {
+        const active = p.id === picked;
+        return (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => onPick(p.id)}
+            className={[
+              'rounded-xl border px-4 py-4 text-left text-sm transition-all',
+              active
+                ? 'border-primary bg-primary/5 ring-2 ring-primary/30'
+                : 'hover:border-foreground/30 hover:bg-muted/40',
+            ].join(' ')}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <strong className="font-medium">{p.displayName}</strong>
+              {p.badge && (
+                <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
+                  {p.badge}
+                </span>
+              )}
             </div>
-            <InfoBox>
-              <p>
-                Pick the default model your assistant uses for chat. You
-                can override this later per agent or per request.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
+            <p className="mt-1 text-xs text-muted-foreground">{p.blurb}</p>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
-    case 4:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={4}
-          totalSteps={TOTAL_STEPS}
-          question="Image &amp; video generation"
-          footer={footer(
-            false,
-            () => onContinueImageVideo(false),
-            !draft.imageVideoKey?.trim(),
-            'Test & Continue',
-            <button
-              type="button"
-              onClick={() => onContinueImageVideo(true)}
-              disabled={isPending}
-              className="text-sm text-white/50 transition-colors hover:text-white/80 disabled:opacity-40"
-            >
-              Skip — I don&apos;t need image/video
-            </button>,
-          )}
-          thinking={isPending}
-        >
-          <div className="flex flex-col gap-5">
-            <KeyInput
-              label="Vercel AI Gateway API Key"
-              placeholder="vck_…"
-              helpHref="https://vercel.com/dashboard/ai-gateway"
-              value={draft.imageVideoKey ?? ''}
-              onChange={(v) => update({ imageVideoKey: v || null })}
-              disabled={isPending}
-            />
-            <InfoBox>
-              <p>
-                Image and video generation use Vercel AI Gateway as a
-                separate, optional capability. Skip this step if you only
-                need text — you can come back later from settings.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
+// ---------------------------------------------------------------------------
+// Stage helpers
+// ---------------------------------------------------------------------------
 
-    case 5:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={5}
-          totalSteps={TOTAL_STEPS}
-          question="Want a voice?"
-          footer={footer(
-            false,
-            () => onContinueElevenlabs(false),
-            !draft.elevenlabsKey?.trim(),
-            'Test & Continue',
-            <button
-              type="button"
-              onClick={() => onContinueElevenlabs(true)}
-              disabled={isPending}
-              className="text-sm text-white/50 transition-colors hover:text-white/80 disabled:opacity-40"
-            >
-              Skip — no voice for now
-            </button>,
-          )}
-          thinking={isPending}
-        >
-          <div className="flex flex-col gap-5">
-            <KeyInput
-              label="ElevenLabs API Key"
-              placeholder="sk_…"
-              helpHref="https://elevenlabs.io/app/settings/api-keys"
-              value={draft.elevenlabsKey ?? ''}
-              onChange={(v) => update({ elevenlabsKey: v || null })}
-              disabled={isPending}
-            />
-            <InfoBox>
-              <p>
-                ElevenLabs powers your assistant&apos;s voice (text-to-speech).
-                Without a key, voice mode stays off — the chat UI still
-                works.
-              </p>
-              <p className="text-white/55">
-                Voice ID and model ID are pre-configured as deployment
-                defaults. An admin can override them later from settings.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
-
-    case 6:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={6}
-          totalSteps={TOTAL_STEPS}
-          question="Telegram bot"
-          footer={footer(
-            false,
-            () => onContinueTelegram(false),
-            !draft.telegramToken?.trim(),
-            'Test & Continue',
-            <button
-              type="button"
-              onClick={() => onContinueTelegram(true)}
-              disabled={isPending}
-              className="text-sm text-white/50 transition-colors hover:text-white/80 disabled:opacity-40"
-            >
-              Skip — no Telegram
-            </button>,
-          )}
-          thinking={isPending}
-        >
-          <div className="flex flex-col gap-5">
-            <KeyInput
-              label="Telegram bot token"
-              placeholder="123456789:ABC-DEF1234ghIkl…"
-              helpHref="https://core.telegram.org/bots/tutorial"
-              value={draft.telegramToken ?? ''}
-              onChange={(v) => update({ telegramToken: v || null })}
-              disabled={isPending}
-            />
-            <InfoBox>
-              <p>
-                One Telegram bot for the entire company. Each user later
-                links their personal Telegram account during their own
-                onboarding.
-              </p>
-              <p className="text-white/55">
-                Don&apos;t have a bot yet? Open Telegram, search for{' '}
-                <strong>@BotFather</strong>, send{' '}
-                <code className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-[11px]">
-                  /newbot
-                </code>
-                , answer two questions, paste the token here.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
-
-    case 7:
-      return (
-        <StepShell
-          mascotLabel="MastraClaw"
-          step={7}
-          totalSteps={TOTAL_STEPS}
-          question="Composio integrations"
-          footer={footer(
-            false,
-            () => onFinishComposio(false),
-            !draft.composioKey?.trim(),
-            'Finish setup',
-            <button
-              type="button"
-              onClick={() => onFinishComposio(true)}
-              disabled={isPending}
-              className="text-sm text-white/50 transition-colors hover:text-white/80 disabled:opacity-40"
-            >
-              Skip & finish
-            </button>,
-          )}
-          thinking={isPending}
-        >
-          <div className="flex flex-col gap-5">
-            <KeyInput
-              label="Composio API key"
-              placeholder="ak_…"
-              helpHref="https://platform.composio.dev/settings"
-              value={draft.composioKey ?? ''}
-              onChange={(v) => update({ composioKey: v || null })}
-              disabled={isPending}
-            />
-            <InfoBox title="What is Composio?">
-              <p>
-                Composio is how your assistant talks to Gmail, Google
-                Calendar, Slack, GitHub, Notion, and dozens of other tools
-                — without you having to wire each one up by hand or store
-                anyone&apos;s password.
-              </p>
-              <p>
-                <strong>One Composio project = your whole company.</strong>{' '}
-                This single API key represents the entire MastraClaw
-                deployment. Every user who logs in later will connect their
-                own Gmail/Slack/etc. accounts under their own private
-                namespace inside this one project.
-              </p>
-              <p className="text-white/65">
-                <strong>You don&apos;t connect any accounts here.</strong>{' '}
-                This step only saves the company-level key. The actual
-                &quot;connect my Gmail&quot; step happens later for each
-                user the first time their assistant needs that tool, via a
-                one-click OAuth link Composio hosts for you.
-              </p>
-              <p className="text-white/55">
-                No Composio account yet? Sign up at composio.dev, create
-                one project, copy the API key, paste it below.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
+function stageCategory(stage: Stage): ProviderCategory {
+  switch (stage) {
+    case 'text':
+      return 'text';
+    case 'image-video':
+      return 'image-video';
+    case 'voice':
+      return 'voice';
+    case 'finalize':
+      throw new Error('finalize has no category');
   }
 }
 
-// ---------------------------------------------------------------------------
-// Tiny presentational helpers
-// ---------------------------------------------------------------------------
-
-function KeyInput({
-  label,
-  placeholder,
-  helpHref,
-  value,
-  onChange,
-  disabled,
-}: {
-  label: string;
-  placeholder?: string;
-  helpHref?: string;
-  value: string;
-  onChange: (v: string) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <label className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45">
-          {label}
-        </label>
-        {helpHref ? (
-          <a
-            href={helpHref}
-            target="_blank"
-            rel="noreferrer noopener"
-            className="font-mono text-[10px] uppercase tracking-[0.18em] text-amber-300/70 hover:text-amber-200"
-          >
-            Where do I get one? ↗
-          </a>
-        ) : null}
-      </div>
-      <input
-        type="password"
-        autoComplete="off"
-        spellCheck={false}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        disabled={disabled}
-        className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 placeholder:text-white/25 outline-none transition-all focus:border-amber-400/50 focus:bg-white/[0.06] focus:ring-4 focus:ring-amber-400/15"
-      />
-    </div>
-  );
+function nextStage(stage: Stage): Stage {
+  switch (stage) {
+    case 'text':
+      return 'image-video';
+    case 'image-video':
+      return 'voice';
+    case 'voice':
+      return 'finalize';
+    case 'finalize':
+      return 'finalize';
+  }
 }
 
-function ErrorBox({ message }: { message: string }) {
-  return (
-    <div className="rounded-lg border border-rose-500/20 bg-rose-500/[0.06] px-3.5 py-2.5 text-xs text-rose-200/90">
-      {message}
-    </div>
-  );
-}
+const stageConfig: Record<
+  Exclude<Stage, 'finalize'>,
+  { question: string; helpTitle: string; helpBody: React.ReactNode }
+> = {
+  text: {
+    question: 'Pick a text-model provider',
+    helpTitle: 'What is this?',
+    helpBody: (
+      <>
+        <p>
+          The text model is the LLM your assistant uses for chat, reasoning,
+          and tool use. Vercel AI Gateway is the recommended option because a
+          single key unlocks Anthropic, OpenAI, Google, and the OpenRouter
+          catalog — and it also covers image and video generation, so the
+          next step skips automatically.
+        </p>
+      </>
+    ),
+  },
+  'image-video': {
+    question: 'Image and video provider (optional)',
+    helpTitle: 'When do I need this?',
+    helpBody: (
+      <p>
+        Configure this only if you want the assistant to generate or edit
+        images and videos. You can skip and add it later from the
+        settings.
+      </p>
+    ),
+  },
+  voice: {
+    question: 'Voice provider (optional)',
+    helpTitle: 'What is this for?',
+    helpBody: (
+      <p>
+        A voice provider lets the assistant speak (Text-to-Speech) and
+        listen (Speech-to-Text) on channels that support audio messages.
+        We only carry providers that do both directions, so one
+        configuration covers the full voice round-trip. Skip if you only
+        need text — the voice toggle on each channel stays disabled until
+        a voice provider is active.
+      </p>
+    ),
+  },
+};

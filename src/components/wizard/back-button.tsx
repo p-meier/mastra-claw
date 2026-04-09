@@ -5,6 +5,11 @@
  * slides slightly to the left on hover so it's recognizable as a back
  * affordance. Used by both wizards (admin setup, personal onboarding).
  *
+ * Restyled to use App theme tokens (`border`, `text-muted-foreground`)
+ * so the button inherits the surrounding theme — light by default in
+ * the admin wizard, dark inside the personal-onboarding bootstrap stage
+ * where the parent forces `dark` on its container.
+ *
  * Render this conditionally — pass `canGoBack={false}` and the button
  * is omitted entirely so step 1 of any wizard has nothing where the
  * back affordance would otherwise sit.
@@ -26,7 +31,7 @@ export function BackButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="group inline-flex h-10 items-center gap-1.5 rounded-lg border border-white/[0.14] bg-transparent px-4 text-sm text-white/70 transition-colors hover:border-white/[0.30] hover:text-white disabled:pointer-events-none disabled:opacity-30"
+      className="group inline-flex h-10 items-center gap-1.5 rounded-lg border bg-transparent px-4 text-sm text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
     >
       <span
         aria-hidden

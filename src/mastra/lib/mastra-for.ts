@@ -6,7 +6,9 @@ import type { StorageThreadType } from '@mastra/core/memory';
 import type { UIMessage } from 'ai';
 
 import type { CurrentUser } from '@/lib/auth';
+import { channelSecrets } from '@/lib/channels/secrets';
 import { loadProfile, type UserProfile } from '@/lib/onboarding/profile';
+import { providerSecrets } from '@/lib/providers/secrets';
 import { createClient } from '@/lib/supabase/server';
 import { resolveSettings, type ResolvedSettings } from '@/lib/settings/resolve';
 
@@ -19,7 +21,7 @@ import {
 } from './agents-service';
 import { loadLlmCredentials, type LlmCredentials } from './llm-credentials';
 import { resolveLanguageModel } from './resolve-language-model';
-import { appSecrets, userSecrets, APP_SECRET_NAMES } from './secret-service';
+import { appSecrets, userSecrets } from './secret-service';
 
 /**
  * Role-aware Mastra facade. Application code MUST go through this factory
@@ -51,22 +53,22 @@ import { appSecrets, userSecrets, APP_SECRET_NAMES } from './secret-service';
 
 export { AppNotConfiguredError } from './llm-credentials';
 export type { LlmCredentials } from './llm-credentials';
-export type { LlmProvider } from '@/lib/settings/resolve';
+export type { TextProviderId as LlmProvider } from '@/lib/providers/text';
 
 // ---------------------------------------------------------------------------
 // Resolved-credential return types
 // ---------------------------------------------------------------------------
 
 export type ImageVideoCredentials = {
-  provider: 'vercel-gateway';
+  provider: string;
   apiKey: string;
-  baseUrl: string | null;
 };
 
 export type ElevenlabsCredentials = {
   apiKey: string;
   voiceId: string;
-  modelId: string;
+  ttsModelId: string;
+  sttModelId: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -134,55 +136,42 @@ export function mastraFor(currentUser: CurrentUser) {
     },
 
     /**
-     * Resolve image/video credentials. Special-case: if the text provider
-     * is already Vercel AI Gateway, the same key + gateway covers both —
-     * we return the LLM key here too instead of forcing the admin to
-     * enter it twice.
-     *
-     * Returns `null` if image/video was skipped during admin setup.
+     * Resolve image/video credentials for the active provider in that
+     * category. Returns `null` if the admin hasn't configured an
+     * image/video provider yet.
      */
     getImageVideoCredentials: async (): Promise<ImageVideoCredentials | null> => {
       const settings = await resolveSettings();
-
-      // Auto-share if text provider is already Vercel AI Gateway
-      if (settings.llm.provider === 'vercel-gateway') {
-        const apiKey = await appSecrets.get(APP_SECRET_NAMES.llmApiKey);
-        if (!apiKey) return null;
-        return {
-          provider: 'vercel-gateway',
-          apiKey,
-          baseUrl: settings.imageVideo.baseUrl,
-        };
-      }
-
-      if (!settings.imageVideo.provider) return null;
-      const apiKey = await appSecrets.get(APP_SECRET_NAMES.imageVideoApiKey);
+      const active = settings.providers.imageVideo.active;
+      if (!active) return null;
+      const apiKey = await providerSecrets.get(
+        'image-video',
+        active.id,
+        'apiKey',
+      );
       if (!apiKey) return null;
-      return {
-        provider: settings.imageVideo.provider,
-        apiKey,
-        baseUrl: settings.imageVideo.baseUrl,
-      };
+      return { provider: active.id, apiKey };
     },
 
     /**
-     * Resolve ElevenLabs credentials. Voice ID and model ID come from
-     * Tier 0 defaults (`src/lib/defaults.ts`) and can be overridden via
-     * `app_settings` from /admin/settings — both layers go through
-     * `resolveSettings()`, no env vars involved. Returns null if
-     * ElevenLabs was skipped during admin setup.
+     * Resolve ElevenLabs credentials. After the voice consolidation
+     * ElevenLabs is one of (potentially several) combined TTS+STT
+     * providers in `providers.voice`. We hand back the credentials
+     * only when the active voice provider is in fact `elevenlabs` —
+     * call sites that need a specific implementation should switch
+     * on the active id themselves.
      */
     getElevenlabs: async (): Promise<ElevenlabsCredentials | null> => {
       const settings = await resolveSettings();
-      if (!settings.elevenlabs.configured) return null;
-
-      const apiKey = await appSecrets.get(APP_SECRET_NAMES.elevenlabsApiKey);
+      const active = settings.providers.voice.active;
+      if (!active || active.id !== 'elevenlabs') return null;
+      const apiKey = await providerSecrets.get('voice', 'elevenlabs', 'apiKey');
       if (!apiKey) return null;
-
       return {
         apiKey,
-        voiceId: settings.elevenlabs.voiceId,
-        modelId: settings.elevenlabs.modelId,
+        voiceId: String(active.config.voiceId ?? ''),
+        ttsModelId: String(active.config.ttsModelId ?? ''),
+        sttModelId: String(active.config.sttModelId ?? ''),
       };
     },
 
@@ -190,21 +179,24 @@ export function mastraFor(currentUser: CurrentUser) {
      * Resolve the company-wide Composio API key. Returns null if not
      * configured. Per-user OAuth connections happen via Composio Connect
      * Links at chat time — they don't go through this surface.
+     *
+     * Composio still uses the legacy single-secret name; it has not yet
+     * been ported into the provider/channel registry pattern.
      */
     getComposioApiKey: async (): Promise<string | null> => {
       const settings = await resolveSettings();
       if (!settings.composio.configured) return null;
-      return appSecrets.get(APP_SECRET_NAMES.composioApiKey);
+      return appSecrets.get('composio_api_key');
     },
 
     /**
-     * Resolve the Telegram bot token. Returns null if Telegram was
-     * skipped during admin setup.
+     * Resolve the Telegram bot token. Returns null when the Telegram
+     * channel hasn't been configured yet.
      */
     getTelegramBotToken: async (): Promise<string | null> => {
       const settings = await resolveSettings();
-      if (!settings.telegram.configured) return null;
-      return appSecrets.get(APP_SECRET_NAMES.telegramBotToken);
+      if (!settings.channels.telegram?.configured) return null;
+      return channelSecrets.get('telegram', 'botToken');
     },
 
     /**

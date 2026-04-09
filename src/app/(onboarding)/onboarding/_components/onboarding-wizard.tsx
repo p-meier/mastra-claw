@@ -31,24 +31,18 @@ import { ThinkingDots } from '@/components/wizard/thinking-dots';
 /**
  * Personal Onboarding wizard — single client component.
  *
- * State machine (dynamic — Telegram step only renders if the admin
- * configured a bot at the instance level):
+ * State machine after the channel-registry refactor:
  *
  *   1. tone           (form, no DB writes)
- *   2. telegram       (form, optional, only if telegramConfiguredOnInstance,
- *                     no DB writes)
- *   3. bootstrap chat (LLM chat — terminal step; the chat's
+ *   2. bootstrap chat (LLM chat — terminal step; the chat's
  *                     complete_bootstrap tool fires the single atomic
  *                     commit)
  *
- * The user's *nickname* is captured INSIDE the bootstrap chat as the
- * very first question — it's not a separate form step. Same for
- * everything else about the user; the chat is the single source of
- * truth for the persona Markdown that lands in user_profiles.
- *
- * Back navigation works between form steps freely. From the bootstrap
- * chat sub-view, the "Back to setup" link drops the user back into the
- * previous form step (draft preserved, chat thread cleared).
+ * Channel bindings used to be captured here (the old "telegram" step).
+ * They're now their own user-facing surface under /account/channels —
+ * the user picks a channel, paste the platform identifier, picks an
+ * agent. Personal onboarding is back to being purely about the user's
+ * persona.
  *
  * Nothing is written to Supabase until the bootstrap chat tool fires.
  */
@@ -75,68 +69,40 @@ const TONE_ACCESSORY: Record<Tone, MascotAccessory> = {
   playful: 'sparkles',
 };
 
-export type OnboardingWizardProps = {
-  /** Whether the admin set up Telegram for this instance */
-  telegramConfiguredOnInstance: boolean;
-};
+export type OnboardingWizardProps = Record<string, never>;
 
-type Stage = 'tone' | 'telegram' | 'bootstrap';
+type Stage = 'tone' | 'bootstrap';
 
 type Draft = {
   tone: Tone;
-  telegramSkipped: boolean;
-  telegramUserId: string;
 };
 
-export function OnboardingWizard({
-  telegramConfiguredOnInstance,
-}: OnboardingWizardProps) {
+export function OnboardingWizard() {
   const [stage, setStage] = useState<Stage>('tone');
   const [draft, setDraft] = useState<Draft>({
     // Pre-select the most-common option so a hesitant user can just
     // click Continue. They can always pick a different one if they want.
     tone: 'casual',
-    telegramSkipped: false,
-    telegramUserId: '',
   });
   const [error, setError] = useState<string | null>(null);
 
   const update = (patch: Partial<Draft>) =>
     setDraft((prev) => ({ ...prev, ...patch }));
 
-  // Total form steps before the bootstrap chat: 1 (just tone) or 2
-  // (tone + telegram). Used by the StepShell progress dots so they
-  // reflect actual progress, not a hardcoded count.
-  const totalSteps = telegramConfiguredOnInstance ? 3 : 2;
-  const stepNumber = (() => {
-    if (stage === 'tone') return 1;
-    if (stage === 'telegram') return 2;
-    return totalSteps; // bootstrap is always the last step
-  })();
+  // Personal onboarding is now exactly two stages: pick a tone, then
+  // run the bootstrap chat. Channel bindings live on /account/channels
+  // and are not part of this flow.
+  const totalSteps = 2;
+  const stepNumber = stage === 'tone' ? 1 : totalSteps;
 
   const goNext = () => {
     setError(null);
-    if (stage === 'tone') {
-      // Skip telegram step if admin didn't configure it
-      setStage(telegramConfiguredOnInstance ? 'telegram' : 'bootstrap');
-    } else if (stage === 'telegram') {
-      if (
-        !draft.telegramSkipped &&
-        (!draft.telegramUserId.trim() || !/^\d+$/.test(draft.telegramUserId))
-      ) {
-        setError('Telegram user ID must be a number, or click Skip');
-        return;
-      }
-      setStage('bootstrap');
-    }
+    if (stage === 'tone') setStage('bootstrap');
   };
 
   const goBack = () => {
     setError(null);
-    if (stage === 'telegram') setStage('tone');
-    else if (stage === 'bootstrap') {
-      setStage(telegramConfiguredOnInstance ? 'telegram' : 'tone');
-    }
+    if (stage === 'bootstrap') setStage('tone');
   };
 
   // ----- bootstrap stage renders the chat sub-view -----
@@ -180,6 +146,12 @@ export function OnboardingWizard({
           footer={footer(goNext, false)}
         >
           <div className="flex flex-col gap-5">
+            <InfoBox>
+              <p>
+                This sets the default communication style your assistant
+                uses. You can fine-tune it later from settings.
+              </p>
+            </InfoBox>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               {TONES.map((t) => (
                 <button
@@ -188,87 +160,19 @@ export function OnboardingWizard({
                   onClick={() => update({ tone: t.id })}
                   className={`rounded-xl border px-4 py-4 text-left text-sm transition-all ${
                     draft.tone === t.id
-                      ? 'border-amber-400/60 bg-amber-500/[0.08] text-white ring-2 ring-amber-400/30'
-                      : 'border-white/[0.10] bg-white/[0.025] text-white/75 hover:border-white/[0.20] hover:bg-white/[0.04]'
+                      ? 'border-primary bg-primary/5 text-foreground ring-2 ring-primary/30'
+                      : 'border-border bg-card text-foreground/75 hover:border-foreground/30 hover:bg-muted/40'
                   }`}
                 >
                   {t.label}
                 </button>
               ))}
             </div>
-            <InfoBox>
-              <p>
-                This sets the default communication style your assistant
-                uses. You can fine-tune it later from settings.
-              </p>
-            </InfoBox>
             {error && <ErrorBox message={error} />}
           </div>
         </StepShell>
       );
 
-    case 'telegram':
-      return (
-        <StepShell
-          mascotLabel="Your Personal Assistant"
-          accessory="phone"
-          step={stepNumber}
-          totalSteps={totalSteps}
-          question="Telegram access"
-          footer={footer(
-            goNext,
-            !draft.telegramSkipped && !draft.telegramUserId.trim(),
-            <button
-              type="button"
-              onClick={() => {
-                update({ telegramSkipped: true, telegramUserId: '' });
-                setStage('bootstrap');
-              }}
-              className="text-sm text-white/50 transition-colors hover:text-white/80"
-            >
-              Skip — no Telegram for me
-            </button>,
-          )}
-        >
-          <div className="flex flex-col gap-5">
-            <div className="flex flex-col gap-2">
-              <label
-                htmlFor="telegramUserId"
-                className="font-mono text-[10px] uppercase tracking-[0.18em] text-white/45"
-              >
-                Your Telegram User ID (numeric)
-              </label>
-              <input
-                id="telegramUserId"
-                type="text"
-                inputMode="numeric"
-                autoComplete="off"
-                value={draft.telegramUserId}
-                onChange={(e) =>
-                  update({
-                    telegramUserId: e.target.value,
-                    telegramSkipped: false,
-                  })
-                }
-                placeholder="2083759357"
-                className="h-11 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3.5 text-sm text-white/90 placeholder:text-white/25 outline-none transition-all focus:border-amber-400/50 focus:bg-white/[0.06] focus:ring-4 focus:ring-amber-400/15"
-              />
-            </div>
-            <InfoBox>
-              <p>
-                Your assistant lives behind a single Telegram bot for the
-                whole company. To allow it to talk to you specifically,
-                paste your numeric Telegram User ID below.
-              </p>
-              <p className="text-white/55">
-                Don&apos;t know your ID? Open Telegram and message
-                @userinfobot — it replies with your numeric ID.
-              </p>
-            </InfoBox>
-            {error && <ErrorBox message={error} />}
-          </div>
-        </StepShell>
-      );
   }
 }
 
@@ -283,8 +187,6 @@ type BootstrapStageProps = {
 
 type WizardDraftWire = {
   tone: Tone;
-  telegramSkipped: boolean;
-  telegramUserId: string | null;
 };
 
 /**
@@ -308,17 +210,11 @@ function BootstrapStage({ draft, onBack }: BootstrapStageProps) {
 
   // Memoize so the transport instance survives re-renders. The wizard
   // draft never changes inside the bootstrap stage (the user already
-  // committed those steps before landing here), so we can safely depend
-  // on its primitive fields.
+  // committed the previous step before landing here), so we can safely
+  // depend on its primitive fields.
   const wizardDraft = useMemo<WizardDraftWire>(
-    () => ({
-      tone: draft.tone,
-      telegramSkipped: draft.telegramSkipped,
-      telegramUserId: draft.telegramSkipped
-        ? null
-        : draft.telegramUserId || null,
-    }),
-    [draft.tone, draft.telegramSkipped, draft.telegramUserId],
+    () => ({ tone: draft.tone }),
+    [draft.tone],
   );
 
   const transport = useMemo(
@@ -433,15 +329,27 @@ function BootstrapShell({
    * runs generateObject() against the persona schema and commits
    * deterministically. Use when the model is dragging on or stuck.
    *
-   * The /finalize route accepts AI SDK UIMessage shape; assistant-ui's
-   * AI SDK runtime exports the same shape via `exportExternalState()`.
+   * **Why we don't use `runtime.thread.exportExternalState()`:** that
+   * helper is typed `any` and returns assistant-ui's internal repository
+   * shape, not the AI SDK v6 `UIMessage[]` array our `/finalize` route
+   * validates. The previous version of this code passed the repository
+   * object straight through and the route rejected it with a 400 even
+   * though the conversation itself was healthy.
+   *
+   * Instead we walk `runtime.thread.getState().messages` and convert
+   * each ThreadMessage into a minimal AI SDK v6 UIMessage shape
+   * (`{ id, role, parts: [{ type: 'text', text }] }`). The bootstrap
+   * interview is text-only — no tool calls, no media — so a flat text
+   * extraction is enough for `generateObject` on the server.
    */
   const handleFinishNow = async () => {
     if (isFinishing || completed) return;
     setIsFinishing(true);
     setCommitError(null);
     try {
-      const messages = runtime.thread.exportExternalState();
+      const messages = runtime.thread
+        .getState()
+        .messages.flatMap(threadMessageToUIMessage);
       const res = await fetch('/api/onboarding/bootstrap/finalize', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -468,14 +376,13 @@ function BootstrapShell({
     // scroll) + composer footer. The page itself never scrolls
     // horizontally — overflow-x-hidden enforces that.
     //
-    // The `dark` class scopes the shadcn theme variables to dark mode
-    // for this view so the assistant-ui primitives render in white text
-    // on the dark background instead of falling back to the light
-    // theme's near-black foreground.
-    <div className="dark relative isolate flex h-svh min-h-0 flex-col overflow-x-hidden bg-[#08080b] text-white">
+    // Light-mode shell, matching the rest of the app. Tokens (`bg-background`,
+    // `text-foreground`, `border`) inherit the App theme so this surface
+    // sits coherently next to the wizard step that precedes it.
+    <div className="relative isolate flex h-svh min-h-0 flex-col overflow-x-hidden bg-background text-foreground">
       <div
         aria-hidden
-        className="pointer-events-none absolute -top-40 -left-40 size-[400px] rounded-full opacity-[0.16] blur-3xl sm:size-[700px]"
+        className="pointer-events-none absolute -top-40 -left-40 size-[400px] rounded-full opacity-[0.10] blur-3xl sm:size-[700px]"
         style={{
           background:
             'radial-gradient(closest-side, #f59e0b 0%, transparent 70%)',
@@ -486,7 +393,7 @@ function BootstrapShell({
           Uses flex-wrap so on narrow screens the buttons drop below the
           mascot/title block instead of pushing the layout wider than the
           viewport. */}
-      <header className="relative z-10 flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] bg-[#08080b]/80 px-4 py-3 backdrop-blur-xl sm:gap-4 sm:px-6">
+      <header className="relative z-10 flex shrink-0 flex-wrap items-center justify-between gap-2 border-b bg-background/80 px-4 py-3 backdrop-blur-xl sm:gap-4 sm:px-6">
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="size-10 shrink-0">
             <Mascot
@@ -496,10 +403,10 @@ function BootstrapShell({
             />
           </div>
           <div className="flex min-w-0 flex-col leading-tight">
-            <span className="truncate text-sm font-medium text-white">
+            <span className="truncate text-sm font-medium text-foreground">
               Your Personal Assistant
             </span>
-            <span className="truncate font-mono text-[10px] uppercase tracking-[0.18em] text-white/40">
+            <span className="truncate font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
               Personal setup interview
             </span>
           </div>
@@ -512,7 +419,7 @@ function BootstrapShell({
               onClick={handleFinishNow}
               disabled={isFinishing || isThinking}
               title="Summarize what we've talked about and finish setup right now"
-              className="inline-flex h-9 items-center gap-2 rounded-lg bg-amber-500 px-3 text-xs font-semibold text-black shadow-[0_8px_32px_-8px_rgba(245,158,11,0.5)] transition-all hover:bg-amber-400 disabled:pointer-events-none disabled:opacity-50 sm:h-10 sm:px-4 sm:text-sm"
+              className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50 sm:h-10 sm:px-4 sm:text-sm"
             >
               {isFinishing ? 'Finalizing…' : 'Finish setup'}
             </button>
@@ -532,7 +439,7 @@ function BootstrapShell({
             />
             {commitError && <ErrorBox message={commitError} />}
             {completed && (
-              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.06] px-4 py-3 text-center text-sm text-emerald-200">
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-center text-sm text-emerald-700">
                 All set! Taking you to your dashboard…
               </div>
             )}
@@ -544,22 +451,22 @@ function BootstrapShell({
           overlay covers the input with a 3-dot animation so the user
           can't type, but instead of a flat greyed-out box they see a
           clear "the model is responding" indicator. */}
-      <footer className="relative z-10 shrink-0 border-t border-white/[0.06] bg-[#08080b]/80 px-4 py-3 backdrop-blur-xl sm:px-6 sm:py-4">
+      <footer className="relative z-10 shrink-0 border-t bg-background/80 px-4 py-3 backdrop-blur-xl sm:px-6 sm:py-4">
         <div className="relative mx-auto w-full max-w-2xl">
-          <ComposerPrimitive.Root className="flex w-full items-end gap-2 rounded-lg border border-white/[0.08] bg-white/[0.04] p-2 focus-within:border-amber-400/50 focus-within:bg-white/[0.06] focus-within:ring-4 focus-within:ring-amber-400/15">
+          <ComposerPrimitive.Root className="flex w-full items-end gap-2 rounded-lg border bg-card p-2 focus-within:border-primary/50 focus-within:ring-4 focus-within:ring-primary/15">
             <ComposerPrimitive.Input
               rows={1}
               autoFocus
               placeholder={completed ? 'Done!' : 'Type a reply…'}
               disabled={completed}
-              className="flex-1 resize-none bg-transparent px-2 py-2 text-sm text-white/90 placeholder:text-white/25 outline-none disabled:opacity-50"
+              className="flex-1 resize-none bg-transparent px-2 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none disabled:opacity-50"
             />
             <ThreadPrimitive.If running={false}>
               <ComposerPrimitive.Send asChild>
                 <button
                   type="submit"
                   disabled={completed}
-                  className="inline-flex size-9 items-center justify-center rounded-md bg-amber-500 text-sm font-semibold text-black transition-colors hover:bg-amber-400 disabled:pointer-events-none disabled:opacity-40"
+                  className="inline-flex size-9 items-center justify-center rounded-md bg-primary text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-40"
                 >
                   <span aria-hidden>↑</span>
                   <span className="sr-only">Send</span>
@@ -570,7 +477,7 @@ function BootstrapShell({
               <ComposerPrimitive.Cancel asChild>
                 <button
                   type="button"
-                  className="inline-flex size-9 items-center justify-center rounded-md border border-white/[0.10] bg-white/[0.04] text-white/70 transition-colors hover:bg-white/[0.08]"
+                  className="inline-flex size-9 items-center justify-center rounded-md border bg-muted text-muted-foreground transition-colors hover:bg-muted/80"
                 >
                   <span aria-hidden>■</span>
                   <span className="sr-only">Stop</span>
@@ -580,11 +487,11 @@ function BootstrapShell({
           </ComposerPrimitive.Root>
           {isThinking && !completed && (
             <div
-              className="pointer-events-none absolute inset-0 flex items-center justify-start rounded-lg bg-[#08080b]/70 pl-5 backdrop-blur-[2px]"
+              className="pointer-events-none absolute inset-0 flex items-center justify-start rounded-lg bg-background/70 pl-5 backdrop-blur-[2px]"
               aria-hidden
             >
               <ThinkingDots />
-              <span className="ml-3 font-mono text-[11px] uppercase tracking-[0.18em] text-amber-200/70">
+              <span className="ml-3 font-mono text-[11px] uppercase tracking-[0.18em] text-primary">
                 Thinking…
               </span>
             </div>
@@ -616,7 +523,7 @@ function BootstrapUserMessage() {
   if (isHiddenKickoff) return null;
   return (
     <MessagePrimitive.Root className="flex justify-end">
-      <div className="max-w-[80%] break-words rounded-2xl bg-amber-500/[0.12] px-4 py-2 text-sm text-amber-50 [overflow-wrap:anywhere]">
+      <div className="max-w-[80%] break-words rounded-2xl bg-primary/10 px-4 py-2 text-sm text-foreground [overflow-wrap:anywhere]">
         <MessagePrimitive.Parts />
       </div>
     </MessagePrimitive.Root>
@@ -631,7 +538,7 @@ function BootstrapUserMessage() {
 function BootstrapAssistantMessage() {
   return (
     <MessagePrimitive.Root className="flex justify-start">
-      <div className="max-w-[85%] break-words rounded-2xl bg-white/[0.04] px-4 py-2 text-sm text-white/90 [overflow-wrap:anywhere]">
+      <div className="max-w-[85%] break-words rounded-2xl border bg-card px-4 py-2 text-sm text-foreground [overflow-wrap:anywhere]">
         <MessagePrimitive.Parts>
           {({ part }) => (part.type === 'text' ? <MarkdownText /> : null)}
         </MessagePrimitive.Parts>
@@ -640,9 +547,50 @@ function BootstrapAssistantMessage() {
   );
 }
 
+/**
+ * Convert one assistant-ui `ThreadMessage` to the AI SDK v6 `UIMessage`
+ * shape the `/finalize` route's Zod schema expects. Strips everything
+ * except text parts — the bootstrap interview is text-only, and we
+ * skip the synthetic "(begin)" kickoff so the model isn't confused by
+ * a stray empty user turn.
+ */
+function threadMessageToUIMessage(message: {
+  id: string;
+  role: string;
+  content: ReadonlyArray<{ type: string; text?: string }>;
+}): Array<{
+  id: string;
+  role: 'system' | 'user' | 'assistant';
+  parts: Array<{ type: 'text'; text: string }>;
+}> {
+  if (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system') {
+    return [];
+  }
+  const parts = message.content
+    .filter((p) => p.type === 'text' && typeof p.text === 'string' && p.text.length > 0)
+    .map((p) => ({ type: 'text' as const, text: String(p.text) }));
+  if (parts.length === 0) return [];
+  // Drop the hidden kickoff so /finalize doesn't see it as a real user
+  // message — same logic the visible message component uses.
+  if (
+    message.role === 'user' &&
+    parts.length === 1 &&
+    parts[0].text.trim() === '(begin)'
+  ) {
+    return [];
+  }
+  return [
+    {
+      id: message.id,
+      role: message.role,
+      parts,
+    },
+  ];
+}
+
 function ErrorBox({ message }: { message: string }) {
   return (
-    <div className="rounded-lg border border-rose-500/20 bg-rose-500/[0.06] px-3.5 py-2.5 text-xs text-rose-200/90">
+    <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-xs text-destructive">
       {message}
     </div>
   );

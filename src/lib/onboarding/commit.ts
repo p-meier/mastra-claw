@@ -60,8 +60,6 @@ export type PersonalOnboardingDraft = {
    * section of the final `user_preferences` Markdown.
    */
   tone: Tone;
-  telegramSkipped: boolean;
-  telegramUserId: string | null;
 };
 
 export type CommitResult =
@@ -92,14 +90,10 @@ export async function commitPersonalOnboarding(
   if (!['casual', 'crisp', 'friendly', 'playful'].includes(draft.tone)) {
     return { ok: false, error: 'Invalid tone' };
   }
-  if (
-    !draft.telegramSkipped &&
-    (!draft.telegramUserId || !/^\d+$/.test(draft.telegramUserId))
-  ) {
-    return { ok: false, error: 'Invalid Telegram user ID' };
-  }
 
-  // 1. user_profiles row update — nickname, preferences, completion timestamp
+  // user_profiles row update — nickname, preferences, completion timestamp.
+  // Channel bindings are no longer captured during personal onboarding;
+  // the user wires those up later under /account/channels.
   const { error: profileError } = await supabase
     .from('user_profiles')
     .update({
@@ -115,27 +109,6 @@ export async function commitPersonalOnboarding(
       ok: false,
       error: `Failed to save profile: ${profileError.message}`,
     };
-  }
-
-  // 2. user_telegram_links row, if not skipped. The link itself is
-  // what the channel input processor uses to map an inbound Telegram
-  // message back to the MastraClaw user — channel↔agent routing is
-  // handled by Mastra's `channels` config on the agent, not by a
-  // database `bindings` table.
-  if (!draft.telegramSkipped && draft.telegramUserId) {
-    const telegramId = Number.parseInt(draft.telegramUserId, 10);
-    const { error: linkError } = await supabase
-      .from('user_telegram_links')
-      .upsert(
-        { user_id: user.userId, telegram_user_id: telegramId },
-        { onConflict: 'user_id,telegram_user_id' },
-      );
-    if (linkError) {
-      return {
-        ok: false,
-        error: `Failed to link Telegram: ${linkError.message}`,
-      };
-    }
   }
 
   return { ok: true };
