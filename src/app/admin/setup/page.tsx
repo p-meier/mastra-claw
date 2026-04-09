@@ -1,13 +1,11 @@
 import { redirect } from 'next/navigation';
 
-import { StepShell } from '@/components/wizard/step-shell';
 import { AdminRequiredError, requireAdmin } from '@/lib/auth';
 import { serializeFields } from '@/lib/descriptors/serialize';
 import { getProvidersByCategory } from '@/lib/providers/registry';
 import { resolveSettings } from '@/lib/settings/resolve';
 
 import { AdminSetupWizard } from './_components/admin-setup-wizard';
-import { Handoff } from './_components/handoff';
 
 export const metadata = {
   title: 'Admin setup — MastraClaw',
@@ -16,14 +14,17 @@ export const metadata = {
 /**
  * Admin Setup wizard shell — Server Component.
  *
- * Two branches, gated by `app.setup_completed_at`:
+ * Always mounts the slimmed wizard. The wizard walks the admin through
+ * three provider categories and then lands on the `finalize` step,
+ * which both flips `app.setup_completed_at` and asks whether the admin
+ * also wants to be a regular user (single-user mode → personal
+ * onboarding) or just an administrator (skip → /admin/settings).
  *
- *   - not yet completed → mount the slimmed wizard, which walks the
- *     admin through three provider categories and then calls
- *     `finalizeAdminSetupAction()`.
- *
- *   - already completed → render the handoff screen (Continue with
- *     personal setup vs. Skip).
+ * If the admin reloads `/admin/setup` after the timestamp has already
+ * been flipped (but before they've resolved the personal-onboarding
+ * choice), we boot the wizard directly at the `finalize` stage so they
+ * see the choice screen immediately instead of replaying the provider
+ * picker.
  *
  * The provider descriptors live in `src/lib/providers/`. They contain
  * server-only `probe` functions that cannot cross into the client
@@ -43,20 +44,6 @@ export default async function AdminSetupPage() {
   const settings = await resolveSettings();
   const setupCompleted = settings.app.setupCompletedAt !== null;
 
-  if (setupCompleted) {
-    return (
-      <StepShell
-        mascotLabel="MastraClaw"
-        step={4}
-        totalSteps={4}
-        question="You're all set"
-        footer={null}
-      >
-        <Handoff />
-      </StepShell>
-    );
-  }
-
   const textProviders = getProvidersByCategory('text').map(serializeProvider);
   const imageVideoProviders = getProvidersByCategory('image-video').map(serializeProvider);
   const voiceProviders = getProvidersByCategory('voice').map(serializeProvider);
@@ -71,6 +58,7 @@ export default async function AdminSetupPage() {
         imageVideo: settings.providers.imageVideo.active?.id ?? null,
         voice: settings.providers.voice.active?.id ?? null,
       }}
+      initialStage={setupCompleted ? 'finalize' : 'text'}
     />
   );
 }

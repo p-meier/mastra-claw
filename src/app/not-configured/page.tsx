@@ -42,14 +42,14 @@ export default async function NotConfiguredPage() {
             Please reach out to your administrator. You can come back
             here once they let you know it&apos;s ready.
           </p>
-          {user && (
-            <div className="mt-6 flex flex-col items-center gap-3 border-t pt-4">
+          <div className="mt-6 flex flex-col items-center gap-3 border-t pt-4">
+            {user && (
               <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
                 Signed in as {user.email}
               </p>
-              <SignOutButton />
-            </div>
-          )}
+            )}
+            <SignOutButton />
+          </div>
         </Card>
       </main>
     </div>

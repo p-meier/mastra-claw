@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useTransition } from 'react';
-import { useRouter } from 'next/navigation';
 
 import {
   DescriptorConfigForm,
@@ -15,7 +14,12 @@ import {
 } from '@/lib/providers/actions';
 import type { ProviderCategory } from '@/lib/providers/registry';
 
-import { finalizeAdminSetupAction } from '../actions';
+import {
+  finalizeAdminSetupAction,
+  handoffContinue,
+  handoffSkip,
+} from '../actions';
+import { HandoffStep } from './handoff';
 
 /**
  * Slimmed-down admin setup wizard.
@@ -43,7 +47,7 @@ import { finalizeAdminSetupAction } from '../actions';
  * /admin/settings" model.
  */
 
-type Stage = 'text' | 'image-video' | 'voice' | 'finalize';
+export type Stage = 'text' | 'image-video' | 'voice' | 'finalize';
 
 type AddableProviderProps = {
   id: string;
@@ -85,6 +89,13 @@ export type AdminSetupWizardProps = {
     imageVideo: string | null;
     voice: string | null;
   };
+  /**
+   * When the admin reloads `/admin/setup` after `app.setup_completed_at`
+   * has already been flipped (but before they've resolved their personal
+   * onboarding choice), the page mounts the wizard directly at the
+   * `finalize` stage so they can pick single-user vs admin-only.
+   */
+  initialStage?: Stage;
 };
 
 const STAGE_ORDER: Stage[] = ['text', 'image-video', 'voice', 'finalize'];
@@ -94,9 +105,9 @@ export function AdminSetupWizard({
   imageVideoProviders,
   voiceProviders,
   initialActive,
+  initialStage = 'text',
 }: AdminSetupWizardProps) {
-  const router = useRouter();
-  const [stage, setStage] = useState<Stage>('text');
+  const [stage, setStage] = useState<Stage>(initialStage);
   const [pickedText, setPickedText] = useState<string | null>(initialActive.text);
   const [pickedImageVideo, setPickedImageVideo] = useState<string | null>(
     initialActive.imageVideo,
@@ -132,7 +143,7 @@ export function AdminSetupWizard({
     setStage(prev);
   }
 
-  function handleFinalize(): void {
+  function handleFinalizeAndContinue(): void {
     setError(null);
     startTransition(async () => {
       const result = await finalizeAdminSetupAction();
@@ -140,7 +151,19 @@ export function AdminSetupWizard({
         setError(result.error);
         return;
       }
-      router.refresh();
+      await handoffContinue();
+    });
+  }
+
+  function handleFinalizeAndSkip(): void {
+    setError(null);
+    startTransition(async () => {
+      const result = await finalizeAdminSetupAction();
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      await handoffSkip();
     });
   }
 
@@ -151,21 +174,9 @@ export function AdminSetupWizard({
         step={stepNumber}
         totalSteps={totalSteps}
         question="Ready to finish?"
-        footer={
-          <>
-            <BackButton onClick={goBack} canGoBack />
-            <button
-              type="button"
-              onClick={handleFinalize}
-              disabled={pending}
-              className="inline-flex h-10 items-center rounded-lg bg-primary px-5 text-sm font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
-            >
-              {pending ? 'Finishing…' : 'Finish setup'}
-            </button>
-          </>
-        }
+        footer={<BackButton onClick={goBack} canGoBack />}
       >
-        <div className="flex flex-col gap-4 text-sm text-muted-foreground">
+        <div className="flex flex-col gap-6 text-sm text-muted-foreground">
           <p>
             You can change any of this later from the settings — switch
             providers, swap voices, or connect new messaging accounts
@@ -189,6 +200,13 @@ export function AdminSetupWizard({
               <strong>{pickedVoice ?? 'skipped'}</strong>
             </li>
           </ul>
+
+          <HandoffStep
+            pending={pending}
+            onContinue={handleFinalizeAndContinue}
+            onSkip={handleFinalizeAndSkip}
+          />
+
           {error && <p className="text-destructive">{error}</p>}
         </div>
       </StepShell>

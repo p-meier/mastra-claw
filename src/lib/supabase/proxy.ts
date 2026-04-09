@@ -191,7 +191,12 @@ export async function updateSession(request: NextRequest) {
     const onPersonalOnboarding =
       pathname === '/onboarding' || pathname.startsWith('/onboarding/');
 
-    if (onAdminSetup && appSetupCompleted) {
+    // Don't bounce off /admin/setup just because app setup is done — the
+    // page itself flips into the Handoff screen at that point and the
+    // admin still needs to choose between single-user mode and admin-only
+    // mode. We only bounce once that personal-onboarding decision has
+    // been recorded on the user_profiles row.
+    if (onAdminSetup && appSetupCompleted && userOnboardingResolved) {
       const url = request.nextUrl.clone();
       url.pathname = '/';
       return NextResponse.redirect(url);

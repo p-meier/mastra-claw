@@ -52,9 +52,21 @@ export async function handoffContinue(): Promise<void> {
 export async function handoffSkip(): Promise<void> {
   const user = await requireAdmin();
   const supabase = await createClient();
+  // Stamp the profile with explicit admin-only values so the personal
+  // onboarding gate treats it as fully resolved and never loads the
+  // bootstrap chat for this account. The nickname/preferences make it
+  // obvious from /account/settings that this is an administrator who
+  // chose not to use the assistant personally.
+  const now = new Date().toISOString();
   await supabase
     .from('user_profiles')
-    .update({ onboarding_skipped_at: new Date().toISOString() })
+    .update({
+      nickname: 'Admin',
+      user_preferences:
+        '# Admin account\n\nThis is an administrator account that is not intended to be used as a personal assistant user. Personal onboarding was skipped intentionally during admin setup. If you want to start using MastraClaw as an end user with this account, run the personal onboarding from /account/settings.',
+      bootstrap_thread_id: null,
+      onboarding_completed_at: now,
+    })
     .eq('user_id', user.userId);
-  redirect('/');
+  redirect('/admin/settings');
 }
