@@ -16,6 +16,10 @@
 
 ---
 
+> [!IMPORTANT]
+> **Status: Draft / Work in Progress**
+> This project is currently **not functional**. It is in draft status and will be actively developed over the coming weeks.
+
 > **Architectural decisions live in [`ARCHITECTURE.md`](./ARCHITECTURE.md).** This README is the elevator pitch and the on-ramp; the architecture document is the source of truth for the single-process embedding model, the Supabase backend, multi-tenancy, role-based authorization, the server-only execution boundary, the Main Agent + Sub Agents model, channel bindings, secrets management, and backup procedures.
 
 ## Why MastraClaw
