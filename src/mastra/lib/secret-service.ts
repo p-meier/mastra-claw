@@ -286,8 +286,6 @@ export const APP_SECRET_NAMES = {
   llmApiKey: 'llm_api_key',
   imageVideoApiKey: 'image_video_api_key',
   elevenlabsApiKey: 'elevenlabs_api_key',
-  telegramBotToken: 'telegram_bot_token',
-  composioApiKey: 'composio_api_key',
 } as const;
 
 export type AppSecretName = (typeof APP_SECRET_NAMES)[keyof typeof APP_SECRET_NAMES];

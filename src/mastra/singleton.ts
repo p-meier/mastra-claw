@@ -1,7 +1,6 @@
 import 'server-only';
 
 import { Mastra } from '@mastra/core/mastra';
-import { MastraAuthSupabase } from '@mastra/auth-supabase';
 import { MastraEditor } from '@mastra/editor';
 import { PinoLogger } from '@mastra/loggers';
 import {
@@ -10,9 +9,10 @@ import {
   SensitiveDataFilter,
 } from '@mastra/observability';
 
-import { env } from '@/lib/env';
-import { createPersonalAssistant } from './agents/personal-assistant';
+import { buildAllAgents } from './agents';
 import { storage } from './storage';
+import { allTools } from './tools';
+import { allWorkflows } from './workflows';
 
 /**
  * Process-wide Mastra singleton.
@@ -28,23 +28,9 @@ import { storage } from './storage';
  * Why cache the Promise, not just the resolved Mastra: two concurrent
  * first-callers (e.g. RSC page + parallel route handler on cold start)
  * must share one build. If we only cached the resolved value, both
- * would race, each would call `new Mastra()`, and each would start an
- * independent Telegram polling loop — exactly the bug this file
- * fixes. Caching the Promise makes the second caller await the first's
- * build.
- *
- * Why this matters: `Mastra`'s constructor kicks off
- * `agentChannels.initialize()` as fire-and-forget inside `addAgent()`,
- * which starts the `@chat-adapter/telegram` long-polling loop. Every
- * stray `new Mastra()` creates an orphaned polling loop, and within a
- * few re-evaluations Telegram rejects all concurrent `getUpdates`
- * callers with `Conflict: terminated by other getUpdates request`.
- * Running `new Mastra()` exactly once per process is the whole fix.
- *
- * Side effect, deliberately accepted: any change under
- * `/admin/channels` or `/admin/settings` requires a process restart
- * to take effect — already documented in the admin Channels page
- * banner.
+ * would race, each would call `new Mastra()`, and each would register
+ * duplicate agents. Caching the Promise makes the second caller await
+ * the first's build.
  */
 
 const SLOT = Symbol.for('mastra-claw.singleton');
@@ -65,35 +51,26 @@ export function getMastra(): Promise<Mastra> {
 }
 
 async function buildMastra(): Promise<Mastra> {
-  const personalAssistant = await createPersonalAssistant();
+  const agents = await buildAllAgents();
 
-  // Auth provider for the Mastra HTTP server (plus any direct
-  // `/api/agents/...` endpoints exposed by `mastra start`). This does
-  // NOT gate Next.js Server Actions / Route Handlers — those run
-  // in-process and go through `mastraFor(currentUser)` for their own
-  // role-aware authorization. The default `authorizeUser` in
-  // MastraAuthSupabase checks a `users.isAdmin` column we deliberately
-  // don't have; roles live in `auth.users.raw_app_meta_data.role` per
-  // ARCHITECTURE.md §6.
-  const auth = new MastraAuthSupabase({
-    url: env.NEXT_PUBLIC_SUPABASE_URL,
-    anonKey: env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
-    authorizeUser: (user) => {
-      const role = (user.app_metadata as { role?: string } | undefined)?.role;
-      return role === 'admin';
-    },
-  });
+  // No `server.auth` provider. Mastra runs in-process behind
+  // `withAuthenticatedRoute` (src/app/api/_lib/route-handler.ts) —
+  // every caller authenticates at the Next.js boundary before reaching
+  // the agent. The Hono HTTP surface is not exposed publicly, so
+  // gating it with an auth provider would be cargo-culted. If a future
+  // machine-to-machine surface is required, it lands as a Route
+  // Handler with its own API-key check, not as a Hono provider.
 
   return new Mastra({
-    agents: { personalAssistant },
-    workflows: {},
+    agents,
+    workflows: allWorkflows,
+    tools: allTools,
     scorers: {},
     editor: new MastraEditor(),
     // Mastra calls storage.init() automatically and creates its mastra_*
     // tables on first request. PgVector is added later, attached to a
     // Memory instance — not at the top level.
     storage,
-    server: { auth },
     logger: new PinoLogger({ name: 'Mastra', level: 'info' }),
     observability: new Observability({
       configs: {

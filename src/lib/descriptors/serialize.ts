@@ -22,6 +22,7 @@ export type SerializableDescriptorField = Pick<
   | 'defaultValue'
   | 'options'
   | 'showWhen'
+  | 'modelKind'
 >;
 
 export function serializeFields(
@@ -39,5 +40,6 @@ export function serializeFields(
     defaultValue: f.defaultValue,
     options: f.options,
     showWhen: f.showWhen,
+    modelKind: f.modelKind,
   }));
 }

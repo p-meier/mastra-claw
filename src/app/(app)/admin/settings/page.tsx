@@ -75,16 +75,6 @@ export default async function AdminSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Composio</CardTitle>
-            <CardDescription>
-              {settings.composio.configured
-                ? 'Configured. Re-run the setup wizard to rotate the API key.'
-                : 'Not configured. Run the setup wizard to add a Composio API key for tool federation.'}
-            </CardDescription>
-          </CardHeader>
-        </Card>
       </div>
     </SidebarInset>
   );
@@ -138,6 +128,8 @@ function categoryKey(c: ProviderCategory) {
   switch (c) {
     case 'text':
       return 'text' as const;
+    case 'embedding':
+      return 'embedding' as const;
     case 'image-video':
       return 'imageVideo' as const;
     case 'voice':
@@ -149,6 +141,8 @@ function descriptionFor(category: ProviderCategory): string {
   switch (category) {
     case 'text':
       return 'LLM provider used for chat, agent reasoning, and any other text generation.';
+    case 'embedding':
+      return 'Text-embedding provider used for semantic recall and RAG. Required once either feature is enabled.';
     case 'image-video':
       return 'Image and video generation. The Vercel AI Gateway covers both with a single key.';
     case 'voice':

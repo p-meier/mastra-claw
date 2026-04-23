@@ -3,8 +3,6 @@ import 'server-only';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { cache } from 'react';
 
-import { listChannels } from '@/lib/channels/registry';
-import { DEFAULTS } from '@/lib/defaults';
 import {
   PROVIDER_CATEGORIES,
   type ProviderCategory,
@@ -15,26 +13,16 @@ import { createClient } from '@/lib/supabase/server';
 /**
  * Settings resolver.
  *
- * Walks the `app_settings` table and assembles a fully-typed
+ * Walks the `platform_settings` table and assembles a fully-typed
  * `ResolvedSettings` object that downstream code (the chat route, the
- * channel context loader, the agent factory) can read without knowing
- * about the underlying key/value layout.
+ * agent factory) can read without knowing about the underlying
+ * key/value layout.
  *
- * Schema (Tier 1 = `app_settings`):
+ * Schema (Tier 1 = `platform_settings`):
  *
  *   app.setup_completed_at                            string ISO timestamp | null
  *   providers.{category}.active                       providerId | null
  *   providers.{category}.{providerId}.config          { ... non-secret fields ... }
- *   channels.{channelId}.configured                   boolean
- *   channels.{channelId}.config                       { ... non-secret fields, voiceEnabled }
- *   composio.configured                               boolean
- *
- * The dynamic keys (`providers.*.config`, `channels.*.config`) are
- * validated lazily by looking up the matching descriptor in the
- * registry and asserting that every required non-secret field has a
- * value. Unknown providers/channels (e.g. data left over from a
- * deleted descriptor) are skipped with a console warning rather than
- * crashing the chat route.
  *
  * Two entry points:
  *
@@ -42,8 +30,8 @@ import { createClient } from '@/lib/supabase/server';
  *    request via `react.cache`.
  *
  *  - `resolveSettingsAsService(supabase)` — explicit service-role
- *    client, NOT cached. For headless entry points (Telegram polling,
- *    cron, instrumentation hook).
+ *    client, NOT cached. For headless entry points (cron,
+ *    instrumentation hook).
  */
 
 // ---------------------------------------------------------------------------
@@ -51,7 +39,7 @@ import { createClient } from '@/lib/supabase/server';
 // ---------------------------------------------------------------------------
 
 export type ResolvedDescriptorConfig = {
-  /** The descriptor id (e.g. `'anthropic'`, `'telegram'`). */
+  /** The descriptor id (e.g. `'anthropic'`). */
   id: string;
   /** Validated non-secret config map. Empty `{}` if no fields. */
   config: Record<string, unknown>;
@@ -72,29 +60,15 @@ export type ResolvedProviderCategory = {
   configured: string[];
 };
 
-export type ResolvedChannel = {
-  /** True iff the channel has at least one stored config row. */
-  configured: boolean;
-  /** Validated non-secret config map (includes `voiceEnabled`). */
-  config: Record<string, unknown>;
-};
-
 export type ResolvedSettings = {
   app: {
     setupCompletedAt: Date | null;
   };
   providers: {
     text: ResolvedProviderCategory;
+    embedding: ResolvedProviderCategory;
     imageVideo: ResolvedProviderCategory;
     voice: ResolvedProviderCategory;
-  };
-  channels: Record<string, ResolvedChannel>;
-  telegram: {
-    /** Tuning knob — not in `providers.*` because it's purely runtime. */
-    pollingIntervalMs: number;
-  };
-  composio: {
-    configured: boolean;
   };
 };
 
@@ -103,16 +77,35 @@ export type ResolvedSettings = {
 // ---------------------------------------------------------------------------
 
 const PROVIDER_CONFIG_KEY_RE =
-  /^providers\.(text|image-video|voice)\.([^.]+)\.config$/;
+  /^providers\.(text|embedding|image-video|voice)\.([^.]+)\.config$/;
 const PROVIDER_ACTIVE_KEY_RE =
-  /^providers\.(text|image-video|voice)\.active$/;
-const CHANNEL_CONFIG_KEY_RE = /^channels\.([^.]+)\.config$/;
-const CHANNEL_CONFIGURED_KEY_RE = /^channels\.([^.]+)\.configured$/;
+  /^providers\.(text|embedding|image-video|voice)\.active$/;
+
+// Keys that older mastra-claw installs seeded or wrote and which the
+// refactor no longer reads. Skipped without warning so the log stays
+// clean; a future cleanup migration removes the rows entirely.
+const HISTORICAL_KEYS: ReadonlySet<string> = new Set([
+  'composio.configured',
+  'telegram.configured',
+  'telegram.polling_interval_ms',
+  'elevenlabs.configured',
+  'elevenlabs.voice_id_override',
+  'elevenlabs.model_id_override',
+]);
+
+const HISTORICAL_KEY_PREFIXES: readonly string[] = ['channels.'];
+
+function isHistoricalKey(key: string): boolean {
+  if (HISTORICAL_KEYS.has(key)) return true;
+  return HISTORICAL_KEY_PREFIXES.some((p) => key.startsWith(p));
+}
 
 function categoryKey(c: ProviderCategory): keyof ResolvedSettings['providers'] {
   switch (c) {
     case 'text':
       return 'text';
+    case 'embedding':
+      return 'embedding';
     case 'image-video':
       return 'imageVideo';
     case 'voice':
@@ -145,12 +138,10 @@ function emptyResolvedSettings(): ResolvedSettings {
     app: { setupCompletedAt: null },
     providers: {
       text: emptyCategory(),
+      embedding: emptyCategory(),
       imageVideo: emptyCategory(),
       voice: emptyCategory(),
     },
-    channels: {},
-    telegram: { pollingIntervalMs: DEFAULTS.telegram.pollingIntervalMs },
-    composio: { configured: false },
   };
 }
 
@@ -169,7 +160,7 @@ export async function resolveSettingsAsService(
   supabase: SupabaseClient,
 ): Promise<ResolvedSettings> {
   const { data, error } = await supabase
-    .from('app_settings')
+    .from('platform_settings')
     .select('key, value');
 
   if (error) {
@@ -187,32 +178,11 @@ export async function resolveSettingsAsService(
     providerId: string;
     raw: Record<string, unknown>;
   }> = [];
-  const channelConfigs: Array<{
-    channelId: string;
-    raw: Record<string, unknown>;
-  }> = [];
-  const channelConfigured = new Set<string>();
 
   for (const { key, value } of rows) {
     if (key === 'app.setup_completed_at') {
       if (typeof value === 'string') {
         out.app.setupCompletedAt = new Date(value);
-      }
-      continue;
-    }
-
-    if (key === 'composio.configured') {
-      out.composio.configured = value === true;
-      continue;
-    }
-
-    if (key === 'telegram.polling_interval_ms') {
-      // Legacy fall-through — newer code stores this on
-      // `channels.telegram.config.pollingIntervalMs`. We still honor
-      // an old top-level key for one cycle in case a hand-edited row
-      // exists, then prefer the channel config below.
-      if (typeof value === 'number' && value > 0) {
-        out.telegram.pollingIntervalMs = value;
       }
       continue;
     }
@@ -240,29 +210,17 @@ export async function resolveSettingsAsService(
       continue;
     }
 
-    const channelConfiguredMatch = CHANNEL_CONFIGURED_KEY_RE.exec(key);
-    if (channelConfiguredMatch && value === true) {
-      channelConfigured.add(channelConfiguredMatch[1]);
+    // `organization` is handled by `src/lib/organization.ts`, not
+    // this resolver. Historical keys (`composio.configured`,
+    // `telegram.*`, `channels.*`, etc.) from earlier schema shapes
+    // are silently ignored — they can survive in long-lived installs
+    // and are not worth logging every request. Any truly unknown key
+    // still gets a dev-only warning.
+    if (key === 'organization' || isHistoricalKey(key)) {
       continue;
     }
-
-    const channelConfigMatch = CHANNEL_CONFIG_KEY_RE.exec(key);
-    if (channelConfigMatch) {
-      const channelId = channelConfigMatch[1];
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        channelConfigs.push({
-          channelId,
-          raw: value as Record<string, unknown>,
-        });
-      }
-      continue;
-    }
-
-    // Unknown key — log once but don't crash. A row left over from a
-    // deleted descriptor or a future schema addition should never take
-    // down the chat route.
     if (process.env.NODE_ENV !== 'production') {
-      console.warn(`[settings] ignoring unknown app_settings key: ${key}`);
+      console.warn(`[settings] ignoring unknown platform_settings key: ${key}`);
     }
   }
 
@@ -298,57 +256,6 @@ export async function resolveSettingsAsService(
     }
   }
 
-  // Merge channel configs.
-  for (const { channelId, raw } of channelConfigs) {
-    const { getChannel } = await import('@/lib/channels/registry');
-    const descriptor = getChannel(channelId);
-    if (!descriptor) {
-      console.warn(
-        `[settings] no descriptor for channel ${channelId}, skipping`,
-      );
-      continue;
-    }
-    const validated = validateNonSecretConfig(descriptor, raw);
-    // voiceEnabled is a meta field outside the descriptor's normal
-    // field set; preserve it verbatim if present.
-    if (typeof raw.voiceEnabled === 'boolean') {
-      validated.voiceEnabled = raw.voiceEnabled;
-    }
-    out.channels[channelId] = {
-      configured: true,
-      config: validated,
-    };
-  }
-
-  // Some channels were marked configured via the boolean key but had
-  // no config row yet (e.g. wizard wrote the flag before the config).
-  // Surface them as configured-but-empty so the admin UI can show a
-  // re-edit prompt.
-  for (const channelId of channelConfigured) {
-    if (!out.channels[channelId]) {
-      out.channels[channelId] = { configured: true, config: {} };
-    }
-  }
-
-  // Channels override the legacy top-level Telegram polling default.
-  const telegramConfig = out.channels.telegram?.config;
-  if (
-    telegramConfig &&
-    typeof telegramConfig.pollingIntervalMs === 'number' &&
-    telegramConfig.pollingIntervalMs > 0
-  ) {
-    out.telegram.pollingIntervalMs = telegramConfig.pollingIntervalMs;
-  }
-
-  // Make sure every channel descriptor at least appears in the map
-  // (with `configured: false`) so the admin UI can render an "Add"
-  // card uniformly.
-  for (const channel of listChannels()) {
-    if (!out.channels[channel.id]) {
-      out.channels[channel.id] = { configured: false, config: {} };
-    }
-  }
-
   return out;
 }
 
@@ -358,10 +265,9 @@ export async function resolveSettingsAsService(
 
 /**
  * Convenience helper used by Server Actions: write a single row to
- * `app_settings`. Validation against the per-key schema happens at the
- * action layer (see `src/lib/providers/actions.ts` and
- * `src/lib/channels/actions.ts`) — this helper is the raw Postgres
- * upsert.
+ * `platform_settings`. Validation against the per-key schema happens at the
+ * action layer (see `src/lib/providers/actions.ts`) — this helper is
+ * the raw Postgres upsert.
  */
 export async function upsertSetting(
   supabase: SupabaseClient,
@@ -370,14 +276,14 @@ export async function upsertSetting(
 ): Promise<void> {
   if (value === null || value === undefined) {
     const { error } = await supabase
-      .from('app_settings')
+      .from('platform_settings')
       .delete()
       .eq('key', key);
     if (error) throw new Error(`upsertSetting(${key}): ${error.message}`);
     return;
   }
   const { error } = await supabase
-    .from('app_settings')
+    .from('platform_settings')
     .upsert({ key, value }, { onConflict: 'key' });
   if (error) throw new Error(`upsertSetting(${key}): ${error.message}`);
 }
@@ -391,7 +297,7 @@ export async function readSetting(
   key: string,
 ): Promise<unknown | null> {
   const { data, error } = await supabase
-    .from('app_settings')
+    .from('platform_settings')
     .select('value')
     .eq('key', key)
     .maybeSingle();

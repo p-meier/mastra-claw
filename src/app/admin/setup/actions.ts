@@ -8,19 +8,14 @@ import { createClient } from '@/lib/supabase/server';
 import { resolveSettings, upsertSetting } from '@/lib/settings/resolve';
 
 /**
- * Server actions for the slimmed-down admin setup wizard.
+ * Server actions for the admin setup wizard.
  *
- * After the provider/channel refactor the wizard delegates every
- * provider step to the shared `descriptor-config-form` and the
- * matching `saveProviderConfigAction` from `@/lib/providers/actions`.
- * Those actions handle probes, Vault writes, and `app_settings`
- * upserts on a per-step basis — there is no longer a giant
- * `commitAdminSetupAction` doing the whole thing at the end.
- *
- * The remaining responsibility of this file is the **finalizer**:
- * once the admin has at least an active text provider, flip
- * `app.setup_completed_at` and redirect into the personal-onboarding
- * flow.
+ * Per-provider probes + Vault writes happen through the shared
+ * `saveProviderConfigAction` in `@/lib/providers/actions`. This file
+ * contains the single finalizer that flips `app.setup_completed_at`
+ * once at least an active text provider is configured, then redirects
+ * to `/admin/settings`. On error, returns `{ ok: false, error }` so
+ * the wizard can surface the message inline.
  */
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -34,6 +29,13 @@ export async function finalizeAdminSetupAction(): Promise<ActionResult> {
       error: 'Configure a text-model provider before finishing setup.',
     };
   }
+  if (!settings.providers.embedding.active) {
+    return {
+      ok: false,
+      error:
+        'Configure an embedding provider before finishing setup — semantic recall and RAG workflows require one.',
+    };
+  }
   const supabase = await createClient();
   await upsertSetting(
     supabase,
@@ -41,32 +43,6 @@ export async function finalizeAdminSetupAction(): Promise<ActionResult> {
     new Date().toISOString(),
   );
   revalidatePath('/admin/setup');
-  return { ok: true };
-}
-
-export async function handoffContinue(): Promise<void> {
-  await requireAdmin();
-  redirect('/onboarding');
-}
-
-export async function handoffSkip(): Promise<void> {
-  const user = await requireAdmin();
-  const supabase = await createClient();
-  // Stamp the profile with explicit admin-only values so the personal
-  // onboarding gate treats it as fully resolved and never loads the
-  // bootstrap chat for this account. The nickname/preferences make it
-  // obvious from /account/settings that this is an administrator who
-  // chose not to use the assistant personally.
-  const now = new Date().toISOString();
-  await supabase
-    .from('user_profiles')
-    .update({
-      nickname: 'Admin',
-      user_preferences:
-        '# Admin account\n\nThis is an administrator account that is not intended to be used as a personal assistant user. Personal onboarding was skipped intentionally during admin setup. If you want to start using MastraClaw as an end user with this account, run the personal onboarding from /account/settings.',
-      bootstrap_thread_id: null,
-      onboarding_completed_at: now,
-    })
-    .eq('user_id', user.userId);
+  revalidatePath('/');
   redirect('/admin/settings');
 }

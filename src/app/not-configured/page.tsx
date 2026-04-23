@@ -35,8 +35,8 @@ export default async function NotConfiguredPage() {
           <p className="mt-3 text-sm text-muted-foreground">
             This MastraClaw instance hasn&apos;t been set up yet. An
             administrator needs to complete the initial configuration
-            (LLM provider, model, and channels) before personal accounts
-            can start the onboarding flow.
+            (LLM and embedding providers, at minimum) before the app is
+            ready to use.
           </p>
           <p className="mt-3 text-sm text-muted-foreground">
             Please reach out to your administrator. You can come back

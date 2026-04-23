@@ -1,5 +1,3 @@
-import { redirect } from "next/navigation"
-
 import {
   Card,
   CardContent,
@@ -9,7 +7,7 @@ import {
 } from "@/components/ui/card"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { requireAdmin } from "@/lib/auth"
-import { loadProfile } from "@/lib/onboarding/profile"
+import { loadProfile } from "@/lib/user-profile"
 
 import { ProfilePreferencesForm } from "./_components/profile-preferences-form"
 
@@ -20,12 +18,6 @@ export const metadata = {
 export default async function AccountSettingsPage() {
   const currentUser = await requireAdmin()
   const profile = await loadProfile(currentUser.userId)
-
-  // The proxy gate normally bounces unfinished onboarding to /onboarding,
-  // but be defensive in case of direct URL access.
-  if (!profile?.onboardingCompletedAt) {
-    redirect("/onboarding")
-  }
 
   return (
     <SidebarInset>
@@ -55,8 +47,8 @@ export default async function AccountSettingsPage() {
           </CardHeader>
           <CardContent>
             <ProfilePreferencesForm
-              initialNickname={profile.nickname ?? ""}
-              initialUserPreferences={profile.userPreferences ?? ""}
+              initialPreferredName={profile?.preferredName ?? ""}
+              initialUserPrompt={profile?.userPrompt ?? ""}
             />
           </CardContent>
         </Card>

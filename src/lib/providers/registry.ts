@@ -2,30 +2,30 @@ import 'server-only';
 
 import type { Descriptor } from '@/lib/descriptors/types';
 
+import { EMBEDDING_PROVIDERS } from './embedding';
 import { IMAGE_VIDEO_PROVIDERS } from './image-video';
 import { TEXT_PROVIDERS } from './text';
 import { VOICE_PROVIDERS } from './voice';
 
 /**
- * Provider registry — the closed set of model providers MastraClaw knows
- * how to talk to. Adding a new provider means adding a descriptor to one
- * of the per-category files; no other code change is needed for the
- * admin UI to render it, the wizard to offer it, or the runtime to
+ * Provider registry — the closed set of model providers MastraClaw
+ * knows how to talk to. Adding a new provider means adding a descriptor
+ * to one of the per-category files; no other code change is needed for
+ * the admin UI to render it, the wizard to offer it, or the runtime to
  * instantiate it.
  *
- * Categories after the voice consolidation:
+ * Categories:
  *
  *   - `text`         — LLM for chat / agent reasoning
+ *   - `embedding`    — text-embedding models for semantic recall / RAG
  *   - `image-video`  — image and video generation
  *   - `voice`        — combined Text-to-Speech *and* Speech-to-Text. We
  *                      only carry providers that do both (ElevenLabs,
  *                      OpenAI, …) so the admin doesn't have to wire up
- *                      two services for one feature. Each descriptor
- *                      collects both sets of fields (voice id, TTS
- *                      model, STT model) under one configuration.
+ *                      two services for one feature.
  */
 
-export type ProviderCategory = 'text' | 'image-video' | 'voice';
+export type ProviderCategory = 'text' | 'embedding' | 'image-video' | 'voice';
 
 export type ProviderDescriptor = Descriptor & {
   category: ProviderCategory;
@@ -33,12 +33,14 @@ export type ProviderDescriptor = Descriptor & {
 
 export const PROVIDER_CATEGORIES: readonly ProviderCategory[] = [
   'text',
+  'embedding',
   'image-video',
   'voice',
 ] as const;
 
 const ALL_PROVIDERS: ProviderDescriptor[] = [
   ...TEXT_PROVIDERS,
+  ...EMBEDDING_PROVIDERS,
   ...IMAGE_VIDEO_PROVIDERS,
   ...VOICE_PROVIDERS,
 ];
@@ -65,6 +67,8 @@ export function categoryTitle(category: ProviderCategory): string {
   switch (category) {
     case 'text':
       return 'Text Model';
+    case 'embedding':
+      return 'Embedding Model';
     case 'image-video':
       return 'Image & Video';
     case 'voice':

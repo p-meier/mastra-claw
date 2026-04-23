@@ -14,7 +14,7 @@ import { env } from '@/lib/env';
  * What we DO check:
  *  1. The DB accepts a connection (`select 1`).
  *  2. The `vector` extension exists (needed by future PgVector usage).
- *  3. Our own `app_settings` table exists (proves the bootstrap migration ran).
+ *  3. Our own `platform_settings` table exists (proves migrations ran).
  */
 
 let checked = false;
@@ -40,13 +40,13 @@ export async function assertSupabaseReady(): Promise<void> {
       );
     }
 
-    const appSettings = await sql`
+    const platformSettings = await sql`
       select 1 from information_schema.tables
-      where table_schema = 'public' and table_name = 'app_settings'
+      where table_schema = 'public' and table_name = 'platform_settings'
     `;
-    if (appSettings.length === 0) {
+    if (platformSettings.length === 0) {
       throw new Error(
-        "app_settings table missing — run `npx supabase db push` to apply migrations",
+        "platform_settings table missing — run `npx supabase db push` to apply migrations",
       );
     }
   } catch (err) {

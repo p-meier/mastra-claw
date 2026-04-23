@@ -10,39 +10,15 @@ import { env } from '@/lib/env';
  * cookie-bound `createClient()` in `./server.ts` would fail every RLS
  * check.
  *
- * MastraClaw does not run its own Telegram (or other channel) webhook
- * routes. Channel I/O is delegated to Mastra's built-in `AgentChannels`
- * (`@chat-adapter/telegram`, …), which polls / receives messages
- * outside the Next.js request lifecycle. Both legitimate callers of
- * this client live on that channel path:
+ * Legitimate callers are anything outside a logged-in browser session:
+ * cron jobs, scheduled tasks, boot-time initialisation that needs to
+ * read from Vault before the first HTTP request, or admin migration
+ * scripts. The service-role key bypasses RLS entirely, so callers are
+ * responsible for their own authorization.
  *
- *  - **`src/instrumentation.ts`** — runs once at server boot, before
- *    any HTTP request, to read the Telegram bot token from Supabase
- *    Vault (`app_secret_get` RPC) and seed it into `process.env` so
- *    `createTelegramAdapter()` picks it up when the `Mastra`
- *    constructor wires up `AgentChannels`. No session exists yet at
- *    this point, by definition.
- *  - **`src/mastra/lib/channel-context-processor.ts`** — input
- *    processor invoked on every channel-driven agent call. The
- *    incoming Telegram message carries no Supabase JWT, so this
- *    client is used to resolve `user_telegram_links → user_profiles`,
- *    fetch the active LLM credentials from `app_settings` + Vault,
- *    and call `applyUserContext` before the agent runs.
- *
- * Future headless entry points (cron jobs, other channel adapters,
- * scheduled tasks) belong here as well.
- *
- * **Not** used by:
- *
- *  - Anything driven by a logged-in browser session — those go
- *    through `createClient()` in `./server.ts`, which respects RLS.
- *
- * The service-role key bypasses RLS entirely, so callers are
- * responsible for their own authorization. The discipline:
- * `createServiceClient()` is only constructed from the channel boot
- * path (`src/instrumentation.ts`) and the channel context processor
- * (`src/mastra/lib/channel-context-processor.ts`). CI grep enforces
- * it.
+ * **Not** used by anything driven by a logged-in browser session —
+ * those go through `createClient()` in `./server.ts`, which respects
+ * RLS.
  */
 export function createServiceClient() {
   return createSupabaseClient(

@@ -11,9 +11,7 @@ import {
   CircuitBoardIcon,
   DatabaseIcon,
   GaugeIcon,
-  LinkIcon,
   LogOutIcon,
-  RadioIcon,
   Settings2Icon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -73,7 +71,6 @@ const nav = {
    */
   navAdmin: [
     { title: "Admin Settings", url: "/admin/settings", icon: Settings2Icon },
-    { title: "Channels", url: "/admin/channels", icon: RadioIcon },
   ],
 } as const
 
@@ -242,12 +239,6 @@ export function AppSidebar({ currentUser }: { currentUser: CurrentUser }) {
                     <Link href="/account/settings" className="cursor-pointer">
                       <SettingsIcon />
                       Account Settings
-                    </Link>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem asChild>
-                    <Link href="/account/channels" className="cursor-pointer">
-                      <LinkIcon />
-                      Connected accounts
                     </Link>
                   </DropdownMenuItem>
                 </DropdownMenuGroup>

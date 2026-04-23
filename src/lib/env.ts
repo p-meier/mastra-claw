@@ -50,6 +50,12 @@ const schema = z.object({
   SUPABASE_S3_ENDPOINT: z.string().url().optional(),
   SUPABASE_S3_ACCESS_KEY_ID: z.string().min(1).optional(),
   SUPABASE_S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
+  // The legacy `<ref>.supabase.co/storage/v1/s3` endpoint signs with
+  // `us-east-1` regardless of project region. The newer per-project
+  // subdomain (`<ref>.storage.supabase.co/storage/v1/s3`) signs with
+  // the actual AWS region. Set this when your endpoint is the newer
+  // shape; leave unset to fall back to `us-east-1`.
+  SUPABASE_S3_REGION: z.string().min(1).optional(),
 });
 
 const parsed = schema.safeParse(process.env);

@@ -2,8 +2,10 @@ import { redirect } from 'next/navigation';
 
 import { AdminRequiredError, requireAdmin } from '@/lib/auth';
 import { serializeFields } from '@/lib/descriptors/serialize';
+import { loadOrganization } from '@/lib/organization';
 import { getProvidersByCategory } from '@/lib/providers/registry';
 import { resolveSettings } from '@/lib/settings/resolve';
+import { createClient } from '@/lib/supabase/server';
 
 import { AdminSetupWizard } from './_components/admin-setup-wizard';
 
@@ -14,22 +16,12 @@ export const metadata = {
 /**
  * Admin Setup wizard shell — Server Component.
  *
- * Always mounts the slimmed wizard. The wizard walks the admin through
- * three provider categories and then lands on the `finalize` step,
- * which both flips `app.setup_completed_at` and asks whether the admin
- * also wants to be a regular user (single-user mode → personal
- * onboarding) or just an administrator (skip → /admin/settings).
- *
- * If the admin reloads `/admin/setup` after the timestamp has already
- * been flipped (but before they've resolved the personal-onboarding
- * choice), we boot the wizard directly at the `finalize` stage so they
- * see the choice screen immediately instead of replaying the provider
- * picker.
- *
- * The provider descriptors live in `src/lib/providers/`. They contain
- * server-only `probe` functions that cannot cross into the client
- * component, so we serialize each one's fields here and pass the
- * trimmed view down.
+ * Mounts the six-stage wizard (branding, text, embedding, image-video,
+ * voice, finalize). If the admin hits this page after
+ * `app.setup_completed_at` has already been flipped, we redirect
+ * directly to `/admin/settings` — the proxy normally bounces them, but
+ * the defensive redirect covers the window between a session refresh
+ * and the proxy check.
  */
 export default async function AdminSetupPage() {
   try {
@@ -42,23 +34,34 @@ export default async function AdminSetupPage() {
   }
 
   const settings = await resolveSettings();
-  const setupCompleted = settings.app.setupCompletedAt !== null;
+  if (settings.app.setupCompletedAt !== null) {
+    redirect('/admin/settings');
+  }
+
+  const supabase = await createClient();
+  const organization = await loadOrganization(supabase);
 
   const textProviders = getProvidersByCategory('text').map(serializeProvider);
+  const embeddingProviders = getProvidersByCategory('embedding').map(serializeProvider);
   const imageVideoProviders = getProvidersByCategory('image-video').map(serializeProvider);
   const voiceProviders = getProvidersByCategory('voice').map(serializeProvider);
 
   return (
     <AdminSetupWizard
       textProviders={textProviders}
+      embeddingProviders={embeddingProviders}
       imageVideoProviders={imageVideoProviders}
       voiceProviders={voiceProviders}
       initialActive={{
         text: settings.providers.text.active?.id ?? null,
+        embedding: settings.providers.embedding.active?.id ?? null,
         imageVideo: settings.providers.imageVideo.active?.id ?? null,
         voice: settings.providers.voice.active?.id ?? null,
       }}
-      initialStage={setupCompleted ? 'finalize' : 'text'}
+      initialBranding={{
+        name: organization.name,
+        organizationPrompt: organization.organizationPrompt,
+      }}
     />
   );
 }

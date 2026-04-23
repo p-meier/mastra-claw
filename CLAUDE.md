@@ -1,6 +1,21 @@
 # MastraClaw — Claude Code Instructions
 
-> **Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) first.** It is the authoritative source for every architectural decision in this project: the single-process embedding of Mastra in Next.js, the Supabase backend, multi-tenancy as a foundation, the server-only execution boundary, the Main Agent + Sub Agents model, channel bindings, secrets management, and backups. When this file conflicts with `ARCHITECTURE.md`, `ARCHITECTURE.md` wins. This file is a working-level reference for day-to-day coding conventions.
+> **Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) first.** It is the authoritative source for every architectural decision in this project: the single-process embedding of Mastra in Next.js, the Supabase backend, multi-tenancy as a foundation, the server-only execution boundary, the Main Agent + Sub Agents model, secrets management, and backups. When this file conflicts with `ARCHITECTURE.md`, `ARCHITECTURE.md` wins. This file is a working-level reference for day-to-day coding conventions.
+
+## Current architecture conventions
+
+Load-bearing rules for the codebase. These take precedence over older prose lower in this file.
+
+- **Fork folder split.** Every entry under `src/mastra/agents/`, `src/mastra/tools/`, `src/mastra/workflows/` lives either in `platform/` (upstream-owned, never hand-edited in a fork) or `custom/` (fork-owned, preserved across `npm run sync-upstream`). Each category has a union `index.ts`; the singleton reads from there.
+- **Platform/custom contract.** `AGENTS.md` under `src/mastra/agents/platform/` and `src/mastra/agents/custom/` documents the sync-upstream split. Same pattern applies to `tools/` and `workflows/`.
+- **Provider registry.** Four categories: `text`, `embedding`, `image-video`, `voice`. Descriptors live in `src/lib/providers/*.ts` (UI-facing), construction/read runtime lives in `src/lib/platform-providers/*.ts` (agent-facing). Agents call `buildTextModel(createServiceClient())` — never a hardcoded provider factory, never a `process.env` read.
+- **`platform_settings` table.** The key/value store at `public.platform_settings`. The `organization` row holds branding + org prompt; `providers.<cat>.active` + `providers.<cat>.<id>.config` hold provider selection.
+- **`user_profiles` columns.** `preferred_name`, `user_prompt`, `name`, `avatar_path`, `must_change_password`. Populated either by the user via `/account/settings` or by admin provisioning.
+- **Layered prompts.** `src/mastra/lib/compose-prompt.ts` composes two layers: the org prompt (from `platform_settings.organization.organizationPrompt`) and the user prompt (from `user_profiles.user_prompt`).
+- **Resource IDs.** `user:{userId}` for personal-agent scope, `agent:{agentId}` for global-agent scope. Constructed via `src/lib/agent-ids.ts` helpers — no hand-rolled prefix strings anywhere.
+- **No `server.auth` in the Mastra singleton.** Callers authenticate at `withAuthenticatedRoute` before reaching the in-process agent. `@mastra/auth-supabase` is not a dependency.
+- **Chat surface.** `POST /api/agents/[agentId]/chat` uses `handleChatStream` from `@mastra/ai-sdk` — framework-agnostic in-process handler, no Hono port exposed.
+- **Scripts.** `npm run check-env`, `npm run promote-admin -- <email>`, `npm run apply-migrations`, `npm run sync-upstream` run via `tsx` and read `.env.local` via `dotenv`.
 
 ## Project Overview
 

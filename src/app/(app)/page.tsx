@@ -82,9 +82,9 @@ const recentRuns = [
   },
   {
     id: "wf_05",
-    name: "telegram-reply",
+    name: "workspace-write",
     agent: "Orchestrator",
-    status: "failed",
+    status: "success",
     duration: "1.2s",
   },
 ]

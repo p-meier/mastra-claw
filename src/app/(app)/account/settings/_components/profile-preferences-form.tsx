@@ -23,8 +23,8 @@ function FieldLabel({
 }
 
 /**
- * Profile preferences editor — the user's nickname (how the assistant
- * addresses them) and the free-form Markdown `user_preferences`
+ * Profile preferences editor — the user's preferred name (how the
+ * assistant addresses them) and the free-form Markdown `user_prompt`
  * document that gets injected into every agent prompt.
  *
  * Both fields are pre-populated from the current row in user_profiles.
@@ -33,16 +33,16 @@ function FieldLabel({
  */
 
 type Props = {
-  initialNickname: string;
-  initialUserPreferences: string;
+  initialPreferredName: string;
+  initialUserPrompt: string;
 };
 
 export function ProfilePreferencesForm({
-  initialNickname,
-  initialUserPreferences,
+  initialPreferredName,
+  initialUserPrompt,
 }: Props) {
-  const [nickname, setNickname] = useState(initialNickname);
-  const [userPreferences, setUserPreferences] = useState(initialUserPreferences);
+  const [preferredName, setPreferredName] = useState(initialPreferredName);
+  const [userPrompt, setUserPrompt] = useState(initialUserPrompt);
   const [status, setStatus] = useState<
     | { kind: 'idle' }
     | { kind: 'success' }
@@ -51,15 +51,15 @@ export function ProfilePreferencesForm({
   const [isPending, startTransition] = useTransition();
 
   const isDirty =
-    nickname !== initialNickname || userPreferences !== initialUserPreferences;
+    preferredName !== initialPreferredName || userPrompt !== initialUserPrompt;
 
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setStatus({ kind: 'idle' });
     startTransition(async () => {
       const result = await updateProfilePreferencesAction({
-        nickname,
-        userPreferences,
+        preferredName,
+        userPrompt,
       });
       if (result.ok) {
         setStatus({ kind: 'success' });
@@ -72,11 +72,11 @@ export function ProfilePreferencesForm({
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-6">
       <div className="flex flex-col gap-2">
-        <FieldLabel htmlFor="nickname">How should your assistant call you?</FieldLabel>
+        <FieldLabel htmlFor="preferredName">How should your assistant call you?</FieldLabel>
         <Input
-          id="nickname"
-          value={nickname}
-          onChange={(e) => setNickname(e.target.value)}
+          id="preferredName"
+          value={preferredName}
+          onChange={(e) => setPreferredName(e.target.value)}
           placeholder="Patrick"
           maxLength={100}
           autoComplete="off"
@@ -84,16 +84,16 @@ export function ProfilePreferencesForm({
         />
         <p className="text-muted-foreground text-xs">
           The first name or handle the assistant uses to address you. Stored
-          in <code className="font-mono">user_profiles.nickname</code>.
+          in <code className="font-mono">user_profiles.preferred_name</code>.
         </p>
       </div>
 
       <div className="flex flex-col gap-2">
-        <FieldLabel htmlFor="userPreferences">Personal preferences (Markdown)</FieldLabel>
+        <FieldLabel htmlFor="userPrompt">Personal preferences (Markdown)</FieldLabel>
         <Textarea
-          id="userPreferences"
-          value={userPreferences}
-          onChange={(e) => setUserPreferences(e.target.value)}
+          id="userPrompt"
+          value={userPrompt}
+          onChange={(e) => setUserPrompt(e.target.value)}
           placeholder={`# User Information\nName, age, location\n\n## Professional Background\n…\n\n## Personal Background\n…\n\n## Communication Style\n…`}
           className="min-h-[420px] font-mono text-sm leading-relaxed"
           required

@@ -87,7 +87,7 @@ export const VOICE_PROVIDERS: ProviderDescriptor[] = [
         secret: false,
         defaultValue: DEFAULTS.elevenlabs.voiceId,
         helpText:
-          'Pre-filled with the SHIFT/MastraClaw default voice. Override with any voice id from the ElevenLabs Voice Library.',
+          'Pre-filled with the MastraClaw default voice. Override with any voice id from the ElevenLabs Voice Library.',
       },
       {
         name: 'ttsModelId',

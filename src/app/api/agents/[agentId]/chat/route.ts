@@ -102,7 +102,6 @@ export const POST = withAuthenticatedRoute<
 
     // requireProfile guarantees this is non-null.
     const profile = (await facade.profile())!;
-    const credentials = await facade.getLlmCredentials();
 
     const threadId =
       body.threadId && body.threadId.length > 0
@@ -113,12 +112,6 @@ export const POST = withAuthenticatedRoute<
     const { resourceId } = applyUserContext(requestContext, {
       user,
       profile,
-      llm: {
-        provider: credentials.provider,
-        apiKey: credentials.apiKey,
-        modelId: credentials.defaultModel,
-        baseUrl: credentials.baseUrl,
-      },
       threadId,
     });
 

@@ -1,0 +1,61 @@
+name: Sync upstream
+
+# Weekly sync from the upstream mastra-claw repo into this fork.
+# Opens a pull request if there is anything to merge — never pushes
+# directly to main. Requires the following repo-level configuration:
+#
+#   Settings → Secrets and variables → Actions → Variables:
+#     UPSTREAM_URL   e.g. https://github.com/<org>/<repo>.git
+#
+#   Settings → Secrets and variables → Actions → Secrets:
+#     (nothing extra — GITHUB_TOKEN is sufficient for this workflow)
+#
+# The schedule fires every Monday at 06:00 UTC; adjust to taste or add
+# `workflow_dispatch` for on-demand runs.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run sync-upstream (merge locally, no push)
+        env:
+          UPSTREAM_URL: ${{ vars.UPSTREAM_URL }}
+        run: npm run sync-upstream -- --yes --no-push
+
+      - name: Open pull request if changes
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/sync-upstream
+          commit-message: 'chore: sync upstream mastra-claw'
+          title: 'chore: sync upstream mastra-claw'
+          body: |
+            Automated weekly merge from the upstream mastra-claw repo.
+
+            Conflicts, if any, should only touch files under `src/mastra/**/platform/` —
+            anything in `custom/` is fork territory and upstream will not touch it.
+
+            Review the diff, run `npm run build` locally, and merge when green.
+          delete-branch: true

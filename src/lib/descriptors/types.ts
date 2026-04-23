@@ -81,11 +81,18 @@ export type DescriptorField = {
   /**
    * Conditional rendering. When set, the field is only shown — and only
    * counted as required — if the referenced field has one of the listed
-   * values. Used by Slack (`mode: 'single-workspace' | 'oauth'`) and MS
-   * Teams (`authMethod: 'clientSecret' | 'federated'`) to switch the
-   * visible field set without needing two separate descriptors.
+   * values. Lets one descriptor switch its visible field set without
+   * needing two separate descriptors.
    */
   showWhen?: { field: string; equals: string | string[] };
+
+  /**
+   * For `type === 'model-select'`: which list of probed models this
+   * field pulls from. Image-video descriptors expose one field per
+   * modality; everything else defaults to `'text'`. Ignored for any
+   * other field type.
+   */
+  modelKind?: 'text' | 'embedding' | 'image' | 'video';
 };
 
 /**

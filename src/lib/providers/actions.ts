@@ -156,37 +156,23 @@ export async function saveProviderConfigAction(
 
   // Multi-category fan-out for combined providers.
   //
-  // The Vercel AI Gateway exposes text *and* image+video models behind
-  // one key. When the admin configures it as a text provider we copy
-  // the same credentials into the `image-video` slot so the gateway is
-  // automatically usable for image/video without a second pass through
-  // the wizard. The two slots stay independent in `app_settings` so
-  // the admin can swap one out later without affecting the other.
+  // The Vercel AI Gateway exposes text, embedding, image, *and* video
+  // models behind one key. When the admin configures it as a text
+  // provider we seed the same credentials into the `embedding` and
+  // `image-video` slots so the gateway is automatically usable for
+  // those modalities without a second pass through the wizard. Each
+  // slot stays independent in `platform_settings` so the admin can
+  // swap one out later without affecting the others.
+  //
+  // The seed only creates the Vault key + an empty config row. It
+  // does NOT set the fan-out target as "active" if another provider
+  // is already active in that category, and it does NOT overwrite an
+  // existing Gateway config.
   if (category === 'text' && providerId === 'vercel-gateway') {
     const apiKey = String(merged.apiKey ?? '');
     if (apiKey.length > 0) {
-      await providerSecrets.set(
-        'image-video',
-        'vercel-gateway',
-        'apiKey',
-        apiKey,
-      );
-      await upsertSetting(
-        supabase,
-        'providers.image-video.vercel-gateway.config',
-        {},
-      );
-      const currentImageActive = await readSetting(
-        supabase,
-        'providers.image-video.active',
-      );
-      if (!currentImageActive) {
-        await upsertSetting(
-          supabase,
-          'providers.image-video.active',
-          'vercel-gateway',
-        );
-      }
+      await seedGatewayFanout(supabase, 'embedding', apiKey);
+      await seedGatewayFanout(supabase, 'image-video', apiKey);
     }
   }
 
@@ -283,10 +269,14 @@ export async function getProviderSecretFieldStatus(
 // Internals
 // ---------------------------------------------------------------------------
 
-function catKey(c: ProviderCategory): 'text' | 'imageVideo' | 'voice' {
+function catKey(
+  c: ProviderCategory,
+): 'text' | 'embedding' | 'imageVideo' | 'voice' {
   switch (c) {
     case 'text':
       return 'text';
+    case 'embedding':
+      return 'embedding';
     case 'image-video':
       return 'imageVideo';
     case 'voice':
@@ -304,6 +294,46 @@ function isFieldVisible(
     return showWhen.equals.includes(driver);
   }
   return driver === showWhen.equals;
+}
+
+async function seedGatewayFanout(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  targetCategory: Exclude<ProviderCategory, 'text' | 'voice'>,
+  apiKey: string,
+): Promise<void> {
+  // Seed the Vault key.
+  await providerSecrets.set(targetCategory, 'vercel-gateway', 'apiKey', apiKey);
+
+  // Ensure an empty config row exists (idempotent — overwrites an
+  // empty one, leaves a populated one alone).
+  const existing = await readSetting(
+    supabase,
+    `providers.${targetCategory}.vercel-gateway.config`,
+  );
+  if (
+    !existing ||
+    (typeof existing === 'object' &&
+      Object.keys(existing as Record<string, unknown>).length === 0)
+  ) {
+    await upsertSetting(
+      supabase,
+      `providers.${targetCategory}.vercel-gateway.config`,
+      {},
+    );
+  }
+
+  // Set as active only if no provider is active yet in this category.
+  const currentActive = await readSetting(
+    supabase,
+    `providers.${targetCategory}.active`,
+  );
+  if (!currentActive) {
+    await upsertSetting(
+      supabase,
+      `providers.${targetCategory}.active`,
+      'vercel-gateway',
+    );
+  }
 }
 
 async function mergeStoredSecrets(

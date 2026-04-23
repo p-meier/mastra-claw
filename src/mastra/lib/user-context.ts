@@ -8,23 +8,29 @@ import {
 import { z } from 'zod';
 
 import type { CurrentUser } from '@/lib/auth';
-import type { UserProfile } from '@/lib/onboarding/profile';
+import type { UserProfile } from '@/lib/user-profile';
+
+// The LLM provider/model/key do not travel on the RequestContext —
+// agents resolve the active text provider directly from
+// `platform_settings` via `buildTextModel`. What stays here is only
+// the identity block: which user, how they want to be addressed, and
+// their free-form preferences markdown.
 
 /**
  * Cross-cutting user identity injection for every Mastra agent in
  * MastraClaw.
  *
- * Why this exists: per-agent dynamic instructions that read `nickname` and
- * `userPreferences` out of the request context don't scale once we add
+ * Why this exists: per-agent dynamic instructions that read `preferredName`
+ * and `userPrompt` out of the request context don't scale once we add
  * sub-agents. Every agent would have to re-implement the same wiring, and
- * every entry point (chat route, Telegram webhook, cron job, etc.) would
- * have to remember to populate the same set of keys. Bugs in either layer
- * leak data between users.
+ * every entry point (chat route, cron job, etc.) would have to remember
+ * to populate the same set of keys. Bugs in either layer leak data
+ * between users.
  *
  * Instead, this file is the single chokepoint:
  *
  *  - **`applyUserContext()`** is the only place in the codebase that
- *    writes `userId`, `nickname`, `userPreferences`, the resolved model,
+ *    writes `userId`, `preferredName`, `userPrompt`, the resolved model,
  *    and the framework-reserved `MASTRA_RESOURCE_ID_KEY` /
  *    `MASTRA_THREAD_ID_KEY` keys onto a `RequestContext`. Every entry
  *    point that invokes an agent calls it. CI grep enforces this:
@@ -52,62 +58,25 @@ import type { UserProfile } from '@/lib/onboarding/profile';
 /**
  * Shared request-context schema for user identity. Every agent's own
  * `requestContextSchema` should extend this so that the dynamic
- * instructions and model resolver can read the same keys.
+ * instructions can read the same keys.
  *
  * **All fields are optional at the schema level on purpose.** Mastra
- * validates `requestContextSchema` *before* input processors run, and
- * channel-driven requests (Telegram, Slack, …) populate these keys in
- * the `ChannelUserContextProcessor` — they aren't present yet at
- * validation time. The runtime guarantee that they ARE present by the
- * time the agent calls the LLM lives in the `applyUserContext`
- * chokepoint, which every entry point (web chat route, channel
- * processor) is required to call.
+ * validates `requestContextSchema` *before* input processors run; the
+ * runtime guarantee that they ARE present by the time the agent calls
+ * the LLM lives in the `applyUserContext` chokepoint, which every
+ * entry point (web chat route, future processors) is required to call.
  */
-/**
- * Per-request LLM credentials, set on the request context by every entry
- * point and consumed by an agent's `model: ({ requestContext }) =>`
- * resolver via `resolveLanguageModel()`. This replaces the old
- * `process.env` mutation pattern (`injectProviderKey`) which was racy
- * under concurrent traffic.
- *
- * `apiKey` is sensitive — it lives only on the in-process RequestContext
- * for the duration of one request and is never written to env, logs, or
- * persistent storage by this codebase. Observability traces should be
- * filtered via `SensitiveDataFilter` (see ARCHITECTURE.md §11).
- */
-export const llmContextSchema = z.object({
-  provider: z.enum([
-    'anthropic',
-    'openai',
-    'openrouter',
-    'vercel-gateway',
-    'custom',
-  ]),
-  apiKey: z.string(),
-  modelId: z.string(),
-  baseUrl: z.string().nullable(),
-});
-
-export type LlmContext = z.infer<typeof llmContextSchema>;
-
 export const userContextSchema = z.object({
   userId: z.string().uuid().optional(),
 
-  /** How the user wants to be addressed. Source: `user_profiles.nickname`. */
-  nickname: z.string().nullable().optional(),
+  /** How the user wants to be addressed. Source: `user_profiles.preferred_name`. */
+  preferredName: z.string().nullable().optional(),
 
   /**
-   * Free-form Markdown about the user. Source: `user_profiles.user_preferences`.
+   * Free-form Markdown about the user. Source: `user_profiles.user_prompt`.
    * Loaded verbatim into the system prompt under `<preferences>` tags.
    */
-  userPreferences: z.string().nullable().optional(),
-
-  /**
-   * Resolved LLM credentials for this request. Optional at the schema
-   * level so a hand-rolled Studio invocation can omit it and let the
-   * agent fall back to a Mastra-router model string.
-   */
-  llm: llmContextSchema.optional(),
+  userPrompt: z.string().nullable().optional(),
 });
 
 export type UserContext = z.infer<typeof userContextSchema>;
@@ -119,8 +88,6 @@ export type UserContext = z.infer<typeof userContextSchema>;
 export type ApplyUserContextInput = {
   user: CurrentUser;
   profile: UserProfile;
-  /** Resolved per-request LLM credentials (provider + apiKey + modelId + baseUrl). */
-  llm: LlmContext;
   /** Optional thread id; framework will create one per call if omitted. */
   threadId?: string;
 };
@@ -128,12 +95,11 @@ export type ApplyUserContextInput = {
 /**
  * The single chokepoint for populating the request context that an agent
  * sees. **Every** entry point that invokes a MastraClaw agent must go
- * through this function — chat route, Telegram dispatch, cron job,
- * everything.
+ * through this function — chat route, cron job, everything.
  *
  * Side effects (on the passed-in `RequestContext`):
  *
- *  - Sets `userId`, `nickname`, `userPreferences`, `model` (read by the
+ *  - Sets `userId`, `preferredName`, `userPrompt`, `llm` (read by the
  *    agent's `instructions` resolver and `model` resolver).
  *  - Sets `MASTRA_RESOURCE_ID_KEY = "user_<userId>"`. This is the per-user
  *    isolation key — Mastra rejects any thread access under a different
@@ -149,7 +115,7 @@ export function applyUserContext(
   rc: RequestContext,
   input: ApplyUserContextInput,
 ): { resourceId: string } {
-  const { user, profile, llm, threadId } = input;
+  const { user, profile, threadId } = input;
 
   if (user.userId !== profile.userId) {
     throw new Error(
@@ -158,9 +124,8 @@ export function applyUserContext(
   }
 
   rc.set('userId', user.userId);
-  rc.set('nickname', profile.nickname);
-  rc.set('userPreferences', profile.userPreferences);
-  rc.set('llm', llm);
+  rc.set('preferredName', profile.preferredName);
+  rc.set('userPrompt', profile.userPrompt);
 
   const resourceId = `user_${user.userId}`;
   rc.set(MASTRA_RESOURCE_ID_KEY, resourceId);
@@ -191,29 +156,23 @@ export function applyUserContext(
  *     });
  *
  * The returned function reads the same keys that `applyUserContext` set.
- * It is forgiving by design: missing `nickname` / `userPreferences` are
- * silently omitted, so an agent can still be invoked from Mastra Studio
- * with a hand-rolled (incomplete) request context for development.
+ * It is forgiving by design: missing `preferredName` / `userPrompt` are
+ * silently omitted, so an agent can still be invoked from a hand-rolled
+ * request context without crashing.
  */
 export function withUserContext(baseInstructions: string) {
-  // Returns an `instructions` resolver compatible with Mastra's
-  // `Agent({ instructions })` field. The `requestContext` is typed
-  // loosely as `RequestContext` (no schema generic) so this single
-  // helper plugs into every agent regardless of how that agent extends
-  // `userContextSchema` for its own keys. The internal `get()` calls
-  // are still safe — `applyUserContext()` is the only writer and
-  // guarantees these keys are present.
   return async ({
     requestContext,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     requestContext: RequestContext<any>;
   }): Promise<string> => {
-    const nickname = (requestContext.get('nickname') as string | null) ?? null;
-    const userPreferences =
-      (requestContext.get('userPreferences') as string | null) ?? null;
+    const preferredName =
+      (requestContext.get('preferredName') as string | null) ?? null;
+    const userPrompt =
+      (requestContext.get('userPrompt') as string | null) ?? null;
 
-    return composeInstructions(baseInstructions, { nickname, userPreferences });
+    return composeInstructions(baseInstructions, { preferredName, userPrompt });
   };
 }
 
@@ -223,13 +182,13 @@ export function withUserContext(baseInstructions: string) {
 
 function composeInstructions(
   base: string,
-  ctx: { nickname: string | null; userPreferences: string | null },
+  ctx: { preferredName: string | null; userPrompt: string | null },
 ): string {
   const parts: string[] = [base];
 
-  if (ctx.nickname) {
+  if (ctx.preferredName) {
     parts.push(
-      `\n# How to address the user\nAlways call the user **${ctx.nickname}**.`,
+      `\n# How to address the user\nAlways call the user **${ctx.preferredName}**.`,
     );
   }
 
@@ -238,8 +197,8 @@ function composeInstructions(
   // about the user it should know". The Markdown body is editable from
   // /account/settings; the wrapper is added at injection time so the
   // stored value stays clean.
-  if (ctx.userPreferences) {
-    parts.push(`\n<preferences>\n${ctx.userPreferences}\n</preferences>`);
+  if (ctx.userPrompt) {
+    parts.push(`\n<preferences>\n${ctx.userPrompt}\n</preferences>`);
   }
 
   return parts.join('\n');

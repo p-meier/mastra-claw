@@ -829,7 +829,7 @@ The `mastraFor(currentUser).invoke()` helper exposes a status/version override p
 
 Some tools are TypeScript code: they call internal services, hold business logic, need test coverage, are part of the system contract. These live in `src/mastra/tools/`, are registered in `src/mastra/index.ts`, and require a redeploy to change.
 
-Examples: a `sendTelegramMessage` tool that wraps the outbound Telegram client, a `renderCorporatePdf` tool that uses the SHIFT corporate-identity template, a `scheduleReminder` tool that talks to the Cron table.
+Examples: a `sendTelegramMessage` tool that wraps the outbound Telegram client, a `renderCorporatePdf` tool that uses the organisation's corporate-identity template, a `scheduleReminder` tool that talks to the Cron table.
 
 ### 10.2 MCP-provided tools (the dynamic path)
 
