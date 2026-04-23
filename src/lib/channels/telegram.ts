@@ -82,6 +82,11 @@ export const TELEGRAM_CHANNEL: ChannelDescriptor = {
     requiresPublicWebhook: false,
   },
   externalIdLabel: 'Telegram User ID (numeric)',
+  externalIdHelp: {
+    text:
+      'Open Telegram and start a chat with @userinfobot — it replies with your numeric user ID. Paste that number here (just digits, no @username).',
+    url: 'https://t.me/userinfobot',
+  },
   buildAdapter: (creds) =>
     createTelegramAdapter({
       botToken: String(creds.botToken),

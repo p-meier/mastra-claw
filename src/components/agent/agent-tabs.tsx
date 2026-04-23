@@ -4,7 +4,7 @@ import type { StorageThreadType } from '@mastra/core/memory';
 import type { UIMessage } from 'ai';
 import { FolderIcon, MessageSquareIcon, MessagesSquareIcon } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 
 import { AgentChat } from '@/components/agent/agent-chat';
 import { ThreadsList } from '@/components/agent/threads-list';
@@ -36,7 +36,33 @@ export function AgentTabs({
   const router = useRouter();
   const searchParams = useSearchParams();
   const tab = searchParams.get('tab') ?? 'chat';
-  const threadId = searchParams.get('thread') ?? undefined;
+  const threadIdFromUrl = searchParams.get('thread') ?? undefined;
+
+  // Stable client-generated thread id used when the URL has no
+  // `?thread=` param (i.e. the user is starting a fresh conversation
+  // from the agent landing).
+  //
+  // **Why we need this.** The chat route generates a fresh
+  // `chat_<userId>_<Date.now()>` id whenever `body.threadId` is
+  // missing. Without a stable id, every request — including the
+  // tool-approval resume rewrite from `MastraChatTransport` — would
+  // get a brand-new thread, so the resume would target an empty
+  // workflow snapshot. By pinning the id here and threading it
+  // through `<AgentChat>` into the transport's static body, every
+  // outgoing request in the session targets the same Mastra thread.
+  //
+  // The id is initialised once per `AgentTabs` mount via the
+  // `useState` lazy initialiser, so it survives re-renders. When
+  // the URL already carries a `?thread=` (e.g. the user clicked
+  // into an existing conversation), we ignore the generated id
+  // entirely and use the URL value instead.
+  const [generatedThreadId] = useState(() => {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+      return `chat_${crypto.randomUUID()}`;
+    }
+    return `chat_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  });
+  const effectiveThreadId = threadIdFromUrl ?? generatedThreadId;
 
   const handleTabChange = useCallback(
     (value: string) => {
@@ -89,15 +115,19 @@ export function AgentTabs({
         hidden={tab !== 'chat'}
       >
         {/*
-         * Re-mount the chat surface when the selected thread changes
-         * so the runtime is rebuilt with the new id + initial
-         * messages. The runtime is created once per `useChatRuntime`
-         * call and Phase 1 doesn't need a swap-in-place model.
+         * Re-mount the chat surface when the selected thread
+         * changes (the user clicked into a different conversation).
+         * The runtime is created once per `useChatRuntime` call so
+         * a key change rebuilds it from scratch with the new id +
+         * initial messages. The tool-approval resume flow updates
+         * the chat in place via the custom transport (see
+         * `tool-approval-buttons.tsx`) so it does not need a
+         * remount.
          */}
         <AgentChat
-          key={threadId ?? '__new__'}
+          key={effectiveThreadId}
           agentId={agentId}
-          threadId={threadId}
+          threadId={effectiveThreadId}
           initialMessages={initialMessages}
         />
       </TabsContent>

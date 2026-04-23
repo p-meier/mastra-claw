@@ -1,62 +1,94 @@
 'use client';
 
-import type {
-  ToolCallMessagePartComponent,
-  EmptyMessagePartComponent,
-} from '@assistant-ui/react';
+import type { EmptyMessagePartComponent } from '@assistant-ui/react';
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
 } from '@assistant-ui/react';
-import {
-  AssistantChatTransport,
-  useChatRuntime,
-} from '@assistant-ui/react-ai-sdk';
+import { useChatRuntime } from '@assistant-ui/react-ai-sdk';
 import type { UIMessage } from 'ai';
-import {
-  ArrowUpIcon,
-  CheckIcon,
-  ChevronDownIcon,
-  Loader2Icon,
-  SquareIcon,
-  TriangleAlertIcon,
-  WrenchIcon,
-} from 'lucide-react';
+import { ArrowUpIcon, Loader2Icon, SquareIcon } from 'lucide-react';
 import { useMemo } from 'react';
 
 import { MarkdownText } from '@/components/assistant-ui/markdown-text';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
+import {
+  AgentChatContextProvider,
+  ToolCallApprovalDataPart,
+  ToolCallSuspendedDataPart,
+  ToolFallback,
+  createMastraChatTransport,
+} from './tool-call';
+
 /**
  * Per-agent chat surface built on Assistant UI primitives.
  *
- * The runtime is wired straight to `/api/agents/[agentId]/chat`, which
- * uses `handleChatStream` from `@mastra/ai-sdk` on the server side. The
- * server is responsible for resolving the user, applying user-context
- * via `applyUserContext()`, and enforcing per-user resource isolation
- * via `MASTRA_RESOURCE_ID_KEY` — none of that is the client's
- * responsibility.
+ * The runtime is wired directly to `/api/agents/[agentId]/chat`, which
+ * uses `handleChatStream` from `@mastra/ai-sdk` on the server side.
+ * The server is responsible for resolving the user, applying
+ * user-context via `applyUserContext()`, and enforcing per-user
+ * resource isolation via `MASTRA_RESOURCE_ID_KEY` — none of that is
+ * the client's responsibility.
  *
- * Future thread persistence (selecting an existing thread from the
- * Conversations tab and loading it here) will pass `threadId` into the
- * transport body via the `body` option on `AssistantChatTransport`.
+ * **Why `useChatRuntime` + a custom transport.** `useChatRuntime`
+ * bundles `useChat` + `useAISDKRuntime` *inside*
+ * `useRemoteThreadListRuntime`, which is what makes
+ * `<AssistantRuntimeProvider>` mount as a top-level runtime. An
+ * earlier version of this file inlined `useChat` + `useAISDKRuntime`
+ * directly so we could grab `chat.regenerate({ body })` for the
+ * approval flow — that broke message rendering because the
+ * thread-list wrapper was missing. Instead we keep `useChatRuntime`
+ * and use a `MastraChatTransport` that exposes a `setPendingResume`
+ * setter; the approval buttons stash a payload there and trigger a
+ * regenerate via the runtime API. The transport rewrites the next
+ * outgoing request body to a Mastra resume call.
+ *
+ * **Resume flow at a glance:**
+ * 1. Mastra emits `data-tool-call-approval` (and/or
+ *    `data-tool-call-suspended`) parts on the assistant message when
+ *    a tool requires approval.
+ * 2. `MessagePrimitive.Parts components.data.by_name` routes those
+ *    parts to `ToolCallApprovalDataPart` /
+ *    `ToolCallSuspendedDataPart`. `ToolFallback` deduplicates so
+ *    the standard tool-call card doesn't show alongside the
+ *    dedicated approval card.
+ * 3. On click, `ToolApprovalButtons` calls
+ *    `transport.setPendingResume({ resumeData, runId, toolCallId })`
+ *    and then `aui.thread().startRun({ parentId })` (parentId is
+ *    the user message that triggered the suspended turn).
+ * 4. `startRun` routes through `useExternalStoreRuntime` →
+ *    `chatHelpers.regenerate(...)`. The transport's
+ *    `prepareSendMessagesRequest` consumes the pending resume and
+ *    rewrites the request body to `{ messages: [], threadId,
+ *    resumeData, runId, toolCallId }`.
+ * 5. The chat route detects `resumeData` and forwards it to
+ *    `handleChatStream`, which calls `agent.resumeStream(...)`.
+ * 6. The resumed continuation streams back into the same `Chat`
+ *    instance and is appended in place — the suspended assistant
+ *    message is replaced by the resumed continuation, the rest of
+ *    the thread stays mounted, and there is no page reload.
+ *
+ * **Stable thread id.** When the URL has no `?thread=` (a fresh
+ * conversation), `agent-tabs.tsx` generates a stable client-side
+ * id and passes it down here. We pin it into the transport's
+ * static body so every request — both the initial messages and
+ * the resume rewrite — targets the same Mastra thread. Without
+ * this, the chat route generates a fresh thread id per request and
+ * the resume targets an empty workflow.
  */
 export type AgentChatProps = {
   agentId: string;
-  /** Pre-selected thread id to attach the runtime to. */
-  threadId?: string;
+  /** Stable thread id used for the entire chat session. */
+  threadId: string;
   /**
    * Server-loaded prior messages for the selected thread. Empty when
    * starting a new conversation. Passed straight to `useChatRuntime`
    * via `ChatInit.messages` so the user sees their history without
    * a client round-trip.
-   *
-   * Typed as the AI SDK v6 `UIMessage` from `ai` — that's exactly what
-   * `useChatRuntime` consumes via `ChatInit.messages`, so no parallel
-   * type and no `as never` assertion is needed.
    */
   initialMessages?: UIMessage[];
 };
@@ -68,44 +100,51 @@ export function AgentChat({
 }: AgentChatProps) {
   const transport = useMemo(
     () =>
-      new AssistantChatTransport({
+      createMastraChatTransport({
         api: `/api/agents/${encodeURIComponent(agentId)}/chat`,
-        body: threadId ? { threadId } : undefined,
+        body: { threadId },
       }),
     [agentId, threadId],
   );
 
   // `useChatRuntime` extends AI SDK v6's `ChatInit`, so passing
-  // `messages` + `id` seeds the chat with prior history. The `id` is
-  // important: AI SDK keys its internal Chat instance by id, so
-  // changing `id` (we do it via the parent's `key` prop) creates a
-  // fresh runtime with the new initial state.
+  // `messages` + `id` seeds the chat with prior history. The `id`
+  // matters: the underlying `Chat` is keyed by id, so changing it
+  // (we do via the parent's `key` prop) creates a fresh runtime
+  // with the new initial state.
   const runtime = useChatRuntime({
     id: threadId,
     messages: initialMessages,
     transport,
   });
 
+  const chatContextValue = useMemo(
+    () => ({ agentId, threadId, transport }),
+    [agentId, threadId, transport],
+  );
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <ThreadPrimitive.Root className="flex h-full flex-col">
-        <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto">
-          <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-8">
-            <ThreadPrimitive.Empty>
-              <EmptyState />
-            </ThreadPrimitive.Empty>
+      <AgentChatContextProvider value={chatContextValue}>
+        <ThreadPrimitive.Root className="flex h-full flex-col">
+          <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto">
+            <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-8">
+              <ThreadPrimitive.Empty>
+                <EmptyState />
+              </ThreadPrimitive.Empty>
 
-            <ThreadPrimitive.Messages
-              components={{
-                UserMessage,
-                AssistantMessage,
-              }}
-            />
-          </div>
-        </ThreadPrimitive.Viewport>
+              <ThreadPrimitive.Messages
+                components={{
+                  UserMessage,
+                  AssistantMessage,
+                }}
+              />
+            </div>
+          </ThreadPrimitive.Viewport>
 
-        <Composer />
-      </ThreadPrimitive.Root>
+          <Composer />
+        </ThreadPrimitive.Root>
+      </AgentChatContextProvider>
     </AssistantRuntimeProvider>
   );
 }
@@ -141,27 +180,40 @@ function AssistantMessage() {
        * render-prop form) so we can render every part type the agent
        * emits — not just text. The render-prop form silently dropped
        * tool-call and empty parts, which is why workspace tool calls
-       * and "thinking" state were invisible to the user.
+       * and "thinking" state used to be invisible to the user.
        *
        * - `Text`           streams Markdown via `MarkdownText`
        *                    (`@assistant-ui/react-streamdown` backend)
-       * - `tools.Fallback` shows every tool call (workspace file ops,
-       *                    future MCP tools, …) with status, args, and
-       *                    result in a collapsible card.
-       * - `Empty`          rendered when the assistant message has no
-       *                    parts yet OR the last part is non-text
+       * - `tools.Fallback` shows every tool call with status, args,
+       *                    and result in a collapsible card. Auto-
+       *                    hides when there is a matching
+       *                    `data-tool-call-approval` data part to
+       *                    avoid double rendering — see
+       *                    `tool-fallback.tsx`.
+       * - `data.by_name`   routes Mastra's `data-tool-call-approval`
+       *                    and `data-tool-call-suspended` parts to
+       *                    dedicated approval renderers. The
+       *                    Approve / Decline buttons live inside
+       *                    those renderers and trigger an in-place
+       *                    resume via the custom chat transport —
+       *                    see `tool-approval-buttons.tsx`.
+       * - `Empty`          rendered when the assistant message has
+       *                    no parts yet OR the last part is non-text
        *                    (default `unstable_showEmptyOnNonTextEnd`).
-       *                    This is the natural slot for the "Working…"
-       *                    indicator: it appears the moment the user
-       *                    sends a message and stays visible while a
-       *                    tool call is running, then disappears as
-       *                    soon as text starts streaming.
+       *                    This is the natural slot for the
+       *                    "Working…" indicator.
        */}
       <MessagePrimitive.Parts
         components={{
           Text: AssistantTextBubble,
           Empty: AssistantEmptyIndicator,
           tools: { Fallback: ToolFallback },
+          data: {
+            by_name: {
+              'tool-call-approval': ToolCallApprovalDataPart,
+              'tool-call-suspended': ToolCallSuspendedDataPart,
+            },
+          },
         }}
       />
     </MessagePrimitive.Root>
@@ -179,8 +231,9 @@ function AssistantTextBubble() {
 const AssistantEmptyIndicator: EmptyMessagePartComponent = ({ status }) => {
   // `running` is the loading state — the agent has been invoked but
   // hasn't streamed any text yet (or just finished a tool call and is
-  // about to stream the next chunk). Anything else is a terminal state
-  // we don't want to flash a spinner over, so we render nothing.
+  // about to stream the next chunk). Anything else is a terminal
+  // state we don't want to flash a spinner over, so we render
+  // nothing.
   if (status.type !== 'running') return null;
   return (
     <div className="text-muted-foreground bg-muted/60 inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs">
@@ -189,104 +242,6 @@ const AssistantEmptyIndicator: EmptyMessagePartComponent = ({ status }) => {
     </div>
   );
 };
-
-/**
- * Generic tool-call card. Renders for every tool the agent invokes
- * unless a more specific `tools.by_name` entry takes over.
- *
- * Surfaces:
- * - Humanized tool name (strip the `mastra_workspace_` prefix so
- *   `mastra_workspace_write_file` becomes `Workspace · write file`).
- * - Live status (running spinner / success check / error triangle /
- *   "needs approval" pill when Mastra suspends the call).
- * - Collapsible args (raw JSON, monospaced).
- * - Collapsible result, if present.
- *
- * Implemented with `<details>`/`<summary>` so we don't pull in another
- * disclosure dependency or wrestle with controlled state.
- */
-const ToolFallback: ToolCallMessagePartComponent = ({
-  toolName,
-  args,
-  result,
-  isError,
-  status,
-}) => {
-  const label = humanizeToolName(toolName);
-
-  let StatusIcon = Loader2Icon;
-  let statusClass = 'animate-spin text-muted-foreground';
-  let statusText = 'Running';
-  if (status.type === 'requires-action') {
-    StatusIcon = WrenchIcon;
-    statusClass = 'text-amber-600';
-    statusText = 'Needs approval';
-  } else if (status.type === 'incomplete' || isError) {
-    StatusIcon = TriangleAlertIcon;
-    statusClass = 'text-destructive';
-    statusText = 'Failed';
-  } else if (status.type === 'complete') {
-    StatusIcon = CheckIcon;
-    statusClass = 'text-emerald-600';
-    statusText = 'Done';
-  }
-
-  return (
-    <details className="bg-muted/40 group max-w-[80%] rounded-xl border text-xs">
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2">
-        <StatusIcon className={cn('size-3.5 shrink-0', statusClass)} aria-hidden />
-        <span className="text-foreground font-medium">{label}</span>
-        <span className="text-muted-foreground ml-auto inline-flex items-center gap-1">
-          {statusText}
-          <ChevronDownIcon
-            className="size-3.5 transition-transform group-open:rotate-180"
-            aria-hidden
-          />
-        </span>
-      </summary>
-      <div className="space-y-2 border-t px-3 py-2">
-        {args !== undefined && (
-          <ToolJsonBlock label="Arguments" value={args} />
-        )}
-        {result !== undefined && (
-          <ToolJsonBlock label="Result" value={result} />
-        )}
-      </div>
-    </details>
-  );
-};
-
-function ToolJsonBlock({ label, value }: { label: string; value: unknown }) {
-  let body: string;
-  try {
-    body = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  } catch {
-    body = String(value);
-  }
-  return (
-    <div>
-      <div className="text-muted-foreground mb-1 text-[10px] font-medium tracking-wide uppercase">
-        {label}
-      </div>
-      <pre className="bg-background/60 max-h-64 overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap">
-        {body}
-      </pre>
-    </div>
-  );
-}
-
-function humanizeToolName(toolName: string): string {
-  // Mastra's built-in workspace tools are namespaced as
-  // `mastra_workspace_<verb>` (see `WORKSPACE_TOOLS` in
-  // `@mastra/core/workspace`). Strip the prefix and present them as
-  // "Workspace · <verb>". Other tools fall back to a slug-to-words
-  // conversion.
-  if (toolName.startsWith('mastra_workspace_')) {
-    const verb = toolName.slice('mastra_workspace_'.length).replace(/_/g, ' ');
-    return `Workspace · ${verb}`;
-  }
-  return toolName.replace(/[_-]+/g, ' ');
-}
 
 function Composer() {
   return (

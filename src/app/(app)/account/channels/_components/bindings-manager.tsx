@@ -39,6 +39,10 @@ export type ChannelOption = {
   id: string;
   displayName: string;
   externalIdLabel: string;
+  externalIdHelp?: {
+    text: string;
+    url?: string;
+  };
 };
 
 export type AgentOption = {
@@ -233,6 +237,24 @@ function AddBindingForm({
           onChange={(e) => setExternalId(e.target.value)}
           placeholder="123456789"
         />
+        {channel?.externalIdHelp && (
+          <p className="text-xs text-muted-foreground">
+            {channel.externalIdHelp.text}
+            {channel.externalIdHelp.url && (
+              <>
+                {' '}
+                <a
+                  href={channel.externalIdHelp.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  Learn how →
+                </a>
+              </>
+            )}
+          </p>
+        )}
       </div>
 
       <div className="flex flex-col gap-1.5">

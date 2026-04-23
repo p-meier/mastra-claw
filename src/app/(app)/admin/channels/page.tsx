@@ -99,6 +99,13 @@ export default async function AdminChannelsPage() {
               answers them) is configured under{' '}
               <code className="text-xs">/account/channels</code>.
             </CardDescription>
+            <CardDescription className="mt-2 text-amber-600 dark:text-amber-500">
+              Heads up: channel adapters are wired up at server boot. After
+              adding a new channel, rotating credentials, or toggling voice,
+              restart the Next.js server (or redeploy) so the running
+              process picks up the change — saving here alone will not
+              start the adapter.
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <ChannelSection

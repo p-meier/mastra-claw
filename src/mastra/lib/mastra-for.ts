@@ -12,7 +12,6 @@ import { providerSecrets } from '@/lib/providers/secrets';
 import { createClient } from '@/lib/supabase/server';
 import { resolveSettings, type ResolvedSettings } from '@/lib/settings/resolve';
 
-import { mastra } from '@/mastra';
 import {
   getAgentForUser,
   listAgentThreadsForUser,
@@ -25,9 +24,9 @@ import { appSecrets, userSecrets } from './secret-service';
 
 /**
  * Role-aware Mastra facade. Application code MUST go through this factory
- * instead of importing the raw `mastra` instance — see CLAUDE.md
- * "Multi-tenancy & roles". The raw instance is reserved for
- * `src/mastra/index.ts` and this file.
+ * instead of reaching for the raw Mastra instance — see CLAUDE.md
+ * "Multi-tenancy & roles". The process-wide singleton is reserved for
+ * `src/mastra/singleton.ts` and this file.
  *
  * Phase 1 surface (minimal — just enough to wire the onboarding wizards
  * and the chat route handler). Will grow as more user-facing features
@@ -41,7 +40,6 @@ import { appSecrets, userSecrets } from './secret-service';
  *     mastraFor(user).getImageVideoCredentials()
  *     mastraFor(user).getElevenlabs()
  *     mastraFor(user).agents          per-user agent enumeration
- *     mastraFor(user).raw             escape hatch — pass-through to mastra
  *
  * The full editor facade (agents/prompts/skills/mcp/scorers CRUD with
  * authorId scoping) lands in a follow-up task once the wizards exist.
@@ -222,13 +220,6 @@ export function mastraFor(currentUser: CurrentUser) {
         loadThreadMessagesForUser(currentUser, agentId, threadId),
     },
 
-    /**
-     * Escape hatch — direct access to the raw Mastra instance. Use only
-     * when calling read-only methods that don't need authorId scoping
-     * (e.g. `mastra.getAgentById('personal-assistant')`). Anything that
-     * mutates state should add a typed wrapper here instead.
-     */
-    raw: mastra,
   } as const;
 }
 

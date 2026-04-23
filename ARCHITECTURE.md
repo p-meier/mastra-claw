@@ -54,20 +54,23 @@ src/mastra/
 The `src/mastra/index.ts` file constructs **one** Mastra instance, registers code-defined resources, and configures Storage, Editor, Observability, and Workspace providers. This file is imported by **every** server-side caller via the alias `@/mastra`.
 
 ```ts
-// src/mastra/index.ts
+// src/mastra/singleton.ts
 import { Mastra } from '@mastra/core/mastra';
 import { MastraEditor } from '@mastra/editor';
 import { PostgresStore } from '@mastra/pg';
 // ... etc.
 
-export const mastra = new Mastra({ /* ... */ });
+// Process-wide singleton, Promise-cached, stashed on `process` so it
+// survives the RSC ↔ Route Handler boundary and Next.js dev HMR.
+export function getMastra(): Promise<Mastra> { /* ... */ }
 ```
 
 ```ts
 // src/app/api/agents/[id]/chat/route.ts (a Route Handler — server-only)
-import { mastra } from '@/mastra';
+import { getMastra } from '@/mastra';
 
 export async function POST(req: Request) {
+  const mastra = await getMastra();
   const agent = mastra.getAgentById('main-agent');
   const result = await agent.generate(/* ... */);
   return Response.json(result);
@@ -274,7 +277,7 @@ Both facades expose the **same interface** for the operations that exist in both
 
 ```ts
 // src/mastra/lib/mastra-for.ts
-import { mastra } from '@/mastra';
+import { getMastra } from '@/mastra';
 import type { CurrentUser } from '@/lib/auth';
 import { ForbiddenError, NotFoundError, AdminRequiredError } from './errors';
 

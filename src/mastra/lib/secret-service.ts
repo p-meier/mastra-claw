@@ -1,6 +1,7 @@
 import 'server-only';
 
 import { cache } from 'react';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { createClient } from '@/lib/supabase/server';
 
@@ -55,13 +56,29 @@ async function rpcAppSecretSet(name: string, value: string): Promise<void> {
 
 const rpcAppSecretGet = cache(async (name: string): Promise<string | null> => {
   const supabase = await createClient();
+  return rpcAppSecretGetWithClient(supabase, name);
+});
+
+/**
+ * Boot-time / headless variant of `rpcAppSecretGet`. Takes an explicit
+ * Supabase client (typically `createServiceClient()`) instead of
+ * constructing one from the request cookies — `cookies()` throws
+ * outside a request scope, which crashes `instrumentation.ts` on boot.
+ *
+ * Not wrapped in `react.cache`: that helper itself requires a request
+ * scope and would throw the same way at module load.
+ */
+async function rpcAppSecretGetWithClient(
+  supabase: SupabaseClient,
+  name: string,
+): Promise<string | null> {
   const { data, error } = await supabase.rpc('app_secret_get', { p_name: name });
   if (error) {
     throw new Error(`appSecrets.get(${name}) failed: ${error.message}`);
   }
   // RPC returns the text value directly; null if not present.
   return (data as string | null) ?? null;
-});
+}
 
 async function rpcAppSecretDelete(name: string): Promise<void> {
   const supabase = await createClient();
@@ -206,6 +223,40 @@ export const appSecrets = {
     return all
       .filter((name) => name.startsWith(prefix))
       .map((name) => name.slice(prefix.length));
+  },
+} as const;
+
+/**
+ * Boot-time / headless read surface for app secrets. Mirrors the
+ * `appSecrets.get*` shape but takes an explicit Supabase client as the
+ * first argument. Use this when there is no request scope to read
+ * cookies from — i.e. `instrumentation.ts` and the channel boot path in
+ * `agent-channels.ts`.
+ *
+ * Read-only by design: writes always come from an admin Server Action,
+ * which runs inside a request scope and uses `appSecrets.set*` instead.
+ *
+ * The underlying RPC (`app_secret_get`) is `SECURITY DEFINER` and gates
+ * itself with `is_admin()`, which exempts the `service_role` JWT (see
+ * `supabase/migrations/20260409120255_is_admin_service_role_bypass.sql`).
+ * Passing a non-service-role client here will throw the same admin
+ * check the cookie path enforces.
+ */
+export const appSecretsWithClient = {
+  get(supabase: SupabaseClient, name: string): Promise<string | null> {
+    return rpcAppSecretGetWithClient(supabase, name);
+  },
+
+  getNamespacedField(
+    supabase: SupabaseClient,
+    namespace: string,
+    id: string,
+    field: string,
+  ): Promise<string | null> {
+    return rpcAppSecretGetWithClient(
+      supabase,
+      appSecrets.buildName(namespace, id, field),
+    );
   },
 } as const;
 

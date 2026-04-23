@@ -6,7 +6,7 @@ import type { UIMessage } from 'ai';
 import { z } from 'zod';
 
 import type { CurrentUser } from '@/lib/auth';
-import { mastra } from '@/mastra';
+import { getMastra } from '@/mastra';
 
 /**
  * Per-user agent enumeration. Phase 1 only has code-defined agents
@@ -96,6 +96,7 @@ export async function listAgentsForUser(
   // Phase 1: code-defined agents only. Every user sees every code agent.
   // TODO: when stored agents land, filter by authorId for the user
   // facade and merge with the code registry for admins.
+  const mastra = await getMastra();
   return Object.values(mastra.listAgents());
 }
 
@@ -108,6 +109,15 @@ export async function getAgentForUser(
   agentId: string,
 ): Promise<Agent | null> {
   return findAgentById(agentId);
+}
+
+async function findAgentById(agentId: string): Promise<Agent | null> {
+  const mastra = await getMastra();
+  const registry = mastra.listAgents();
+  for (const agent of Object.values(registry) as Agent[]) {
+    if (agent.id === agentId) return agent;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +135,7 @@ export async function listAgentThreadsForUser(
   user: CurrentUser,
   agentId: string,
 ): Promise<StorageThreadType[]> {
-  const agent = findAgentById(agentId);
+  const agent = await findAgentById(agentId);
   if (!agent) return [];
 
   // `Agent.getMemory()` is async — see
@@ -167,7 +177,7 @@ export async function loadThreadMessagesForUser(
   agentId: string,
   threadId: string,
 ): Promise<UIMessage[] | null> {
-  const agent = findAgentById(agentId);
+  const agent = await findAgentById(agentId);
   if (!agent) return null;
 
   const memory = await agent.getMemory?.();
@@ -196,14 +206,3 @@ export async function loadThreadMessagesForUser(
   return uiMessages;
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
-function findAgentById(agentId: string): Agent | null {
-  const registry = mastra.listAgents();
-  for (const agent of Object.values(registry) as Agent[]) {
-    if (agent.id === agentId) return agent;
-  }
-  return null;
-}

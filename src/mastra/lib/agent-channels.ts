@@ -1,6 +1,6 @@
 import 'server-only';
 
-import { channelSecrets } from '@/lib/channels/secrets';
+import { channelSecretsWithClient } from '@/lib/channels/secrets';
 import { getChannel, listChannels } from '@/lib/channels/registry';
 import { resolveSettingsAsService } from '@/lib/settings/resolve';
 import { createServiceClient } from '@/lib/supabase/service';
@@ -43,7 +43,11 @@ export async function buildAgentChannels(): Promise<Record<string, any>> {
     const credentials: Record<string, unknown> = { ...channelState.config };
     for (const field of channel.fields) {
       if (!field.secret) continue;
-      const value = await channelSecrets.get(channel.id, field.name);
+      const value = await channelSecretsWithClient.get(
+        supabase,
+        channel.id,
+        field.name,
+      );
       if (value) credentials[field.name] = value;
     }
 

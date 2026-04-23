@@ -46,6 +46,7 @@ export default async function AccountChannelsPage() {
       id: c.id,
       displayName: c.displayName,
       externalIdLabel: c.externalIdLabel,
+      externalIdHelp: c.externalIdHelp,
     }));
 
   const agents = await mastraFor(currentUser).agents.list();

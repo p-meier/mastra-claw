@@ -1,6 +1,8 @@
 import 'server-only';
 
-import { appSecrets } from '@/mastra/lib/secret-service';
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+import { appSecrets, appSecretsWithClient } from '@/mastra/lib/secret-service';
 
 import { CHANNEL_SECRET_NAMESPACE } from './registry';
 
@@ -38,6 +40,31 @@ export const channelSecrets = {
     return appSecrets.listFieldsInNamespace(
       CHANNEL_SECRET_NAMESPACE,
       channelId,
+    );
+  },
+} as const;
+
+/**
+ * Boot-time / headless variant of `channelSecrets`. Used by the channel
+ * boot path in `agent-channels.ts`, which runs from
+ * `instrumentation.ts` outside any request scope and therefore cannot
+ * use the cookie-bound `createClient()` underpinning the request-scoped
+ * surface above. Pass an explicit service-role Supabase client.
+ *
+ * Only the read shape (`get`) is exposed — writes always come from an
+ * admin Server Action where the request-scoped path is correct.
+ */
+export const channelSecretsWithClient = {
+  get(
+    supabase: SupabaseClient,
+    channelId: string,
+    field: string,
+  ): Promise<string | null> {
+    return appSecretsWithClient.getNamespacedField(
+      supabase,
+      CHANNEL_SECRET_NAMESPACE,
+      channelId,
+      field,
     );
   },
 } as const;

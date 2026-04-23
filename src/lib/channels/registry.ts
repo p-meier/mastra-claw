@@ -54,6 +54,17 @@ export type ChannelDescriptor = Descriptor & {
    */
   externalIdLabel: string;
   /**
+   * Optional help shown beneath the external-ID input on the user
+   * binding form. `text` is rendered as muted helper copy; `url`, if
+   * present, becomes a "Learn how" link. Use this to tell the user
+   * *how* to discover their platform identifier (e.g. which Telegram
+   * bot to message to get their numeric user ID).
+   */
+  externalIdHelp?: {
+    text: string;
+    url?: string;
+  };
+  /**
    * If the descriptor uses conditional fields (`showWhen`), this names
    * the field whose value drives the visible field set. The form
    * component uses this to know which select acts as the mode switch

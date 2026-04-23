@@ -2,7 +2,7 @@ import 'server-only';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { providerSecrets } from '@/lib/providers/secrets';
+import { providerSecretsWithClient } from '@/lib/providers/secrets';
 import type { TextProviderId } from '@/lib/providers/text';
 import { resolveSettingsAsService } from '@/lib/settings/resolve';
 
@@ -75,7 +75,12 @@ export async function loadLlmCredentials(
     );
   }
 
-  const apiKey = await providerSecrets.get('text', active.id, 'apiKey');
+  const apiKey = await providerSecretsWithClient.get(
+    supabase,
+    'text',
+    active.id,
+    'apiKey',
+  );
   if (!apiKey) {
     throw new AppNotConfiguredError(
       `API key for text provider ${active.id}`,
